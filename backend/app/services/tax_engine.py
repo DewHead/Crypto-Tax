@@ -64,17 +64,28 @@ class TaxLedger:
         # 30-Day Wash Sale Rule (Section 94B): If we have recent deferred losses, add them to cost basis
         deferred_loss = 0.0
         if asset in self.recent_losses:
-            # Filter losses within 30 days of this buy
-            valid_losses = []
+            remaining_buy_qty = amount
+            retained_losses = []
+            
             for loss_entry in self.recent_losses[asset]:
-                if tx.timestamp - loss_entry['timestamp'] <= timedelta(days=30):
-                    # Pro-rate the loss if this buy is smaller than the sell that caused the loss?
-                    # ITA usually rolls the whole loss if repurchased.
-                    deferred_loss += loss_entry['loss_ils']
+                if tx.timestamp - loss_entry['timestamp'] <= timedelta(days=30) and remaining_buy_qty > 0:
+                    # Calculate proportion
+                    match_qty = min(remaining_buy_qty, loss_entry['amount'])
+                    proportion = match_qty / loss_entry['amount']
+                    matched_loss_ils = loss_entry['loss_ils'] * proportion
+                    
+                    deferred_loss += matched_loss_ils
+                    remaining_buy_qty -= match_qty
+                    
+                    # Keep the unused portion of the loss if we didn't consume it all
+                    if match_qty < loss_entry['amount']:
+                        loss_entry['amount'] -= match_qty
+                        loss_entry['loss_ils'] -= matched_loss_ils
+                        retained_losses.append(loss_entry)
                 else:
-                    pass # expired loss
-            # For simplicity, we consume all valid deferred losses and clear them
-            self.recent_losses[asset] = [] 
+                    retained_losses.append(loss_entry)
+                    
+            self.recent_losses[asset] = retained_losses
 
         self.inventory[asset].append({
             'tx_id': tx.id,
@@ -249,32 +260,39 @@ class TaxEngine:
         amt_to = tx.amount_to or 0.0
         val_from = await self.get_ils_value(tx.asset_from, amt_from, tx_date, rate)
         val_to = await self.get_ils_value(tx.asset_to, amt_to, tx_date, rate)
+        fee_ils = await self.get_ils_value(tx.fee_asset, tx.fee_amount, tx_date, rate)
 
-        # For swaps, we use the higher of the two valuations if one is missing, 
-        # but preferably val_to for cost basis of new asset.
-        effective_swap_value = val_to if val_to > 0 else val_from
+        # For swaps, we use fiat value if available, otherwise FMV of acquired/disposed asset.
+        if tx.asset_from in ['USD', 'ILS']:
+            effective_swap_value = val_from
+        elif tx.asset_to in ['USD', 'ILS']:
+            effective_swap_value = val_to
+        else:
+            effective_swap_value = val_to if val_to > 0 else val_from
 
         # 2. Process Disposal (Sell / Withdrawal / Fee)
         is_sell = amt_from > 0 and tx.asset_from
         if is_sell:
             asset = tx.asset_from
             qty = amt_from
+            is_fiat = asset in ['USD', 'ILS']
 
             if tx.id not in reconciled_ids:
-                cost_basis = await ledger.consume_lots(asset, qty, tx)
+                cost_basis = await ledger.consume_lots(asset, qty, tx) if not is_fiat else 0.0
 
                 # Valuation of proceeds: If swap, use effective_swap_value
-                proceeds = effective_swap_value if amt_to > 0 else val_from
+                # Subtract the fee from proceeds
+                proceeds = (effective_swap_value if amt_to > 0 else val_from) - fee_ils
 
-                # Fallback for missing cost basis: assume proceeds (Gain 0)
-                if cost_basis == 0 and qty > 0:
-                    cost_basis = proceeds
-                    logger.warning(f"MISSING COST BASIS FALLBACK: {tx.timestamp} {asset} qty={qty}, proceeds={proceeds}")
+                # Fallback for missing cost basis: ITA default assumes ZERO
+                if cost_basis == 0 and qty > 0 and not is_fiat:
+                    tx.is_issue = True
+                    tx.issue_notes = (tx.issue_notes or "") + " | Missing cost basis. ITA default assumes ZERO."
+                    logger.warning(f"MISSING COST BASIS: {tx.timestamp} {asset} qty={qty}. Assumed ZERO.")
 
                 tx.cost_basis_ils = cost_basis
 
                 # ITA Rule: Stablecoins are NOT fiat.
-                is_fiat = asset in ['USD', 'ILS']
                 if not is_fiat and tx.type != TransactionType.withdrawal:
                     tx.is_taxable_event = 1
                     gain = proceeds - cost_basis
@@ -307,7 +325,6 @@ class TaxEngine:
                 cost_basis = effective_swap_value
 
             # Add fee to cost basis
-            fee_ils = await self.get_ils_value(tx.fee_asset, tx.fee_amount, tx_date, rate)
             cost_basis += fee_ils
 
             ledger.add_lot(asset, qty, cost_basis, tx)
@@ -324,11 +341,12 @@ class TaxEngine:
             fee_cost_basis = await ledger.consume_lots(fee_asset, fee_qty, tx)
             
             # Proceeds of fee disposal is its FMV
-            fee_proceeds = await self.get_ils_value(fee_asset, fee_qty, tx_date, rate)
+            fee_proceeds = fee_ils
             
-            # Fallback for missing cost basis
+            # Fallback for missing cost basis: ITA default assumes ZERO
             if fee_cost_basis == 0 and fee_qty > 0:
-                fee_cost_basis = fee_proceeds
+                tx.is_issue = True
+                tx.issue_notes = (tx.issue_notes or "") + f" | Missing cost basis for fee ({fee_asset}). ITA default assumes ZERO."
 
             # Capital gain on the fee itself
             fee_gain = fee_proceeds - fee_cost_basis
