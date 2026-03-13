@@ -44,6 +44,22 @@ from fastapi.responses import StreamingResponse
 
 router = APIRouter()
 
+async def process_zip_background(temp_path: str):
+    """
+    Process ZIP file and recalculate taxes in the background.
+    """
+    try:
+        print(f"Processing ZIP file {temp_path} in background...")
+        await csv_ingestion_service.process_zip(temp_path)
+        async with AsyncSessionLocal() as db:
+            await tax_engine.calculate_taxes(db)
+        print(f"Successfully processed ZIP file {temp_path} in background.")
+    except Exception as e:
+        print(f"Error in background ZIP processing: {e}")
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
 @router.post("/upload")
 async def upload_binance_zip(background_tasks: BackgroundTasks, file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
     """
@@ -57,17 +73,10 @@ async def upload_binance_zip(background_tasks: BackgroundTasks, file: UploadFile
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     
-    try:
-        # Process the ZIP file
-        await csv_ingestion_service.process_zip(temp_path)
-        # Re-calculate taxes after new data is added
-        await tax_engine.calculate_taxes(db)
-    finally:
-        # Clean up
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+    # Process the ZIP file in background
+    background_tasks.add_task(process_zip_background, temp_path)
             
-    return {"status": "success", "message": f"Successfully ingested {file.filename}"}
+    return {"status": "upload_accepted", "message": f"Successfully uploaded {file.filename}. Processing in background."}
 
 @router.post("/sync")
 async def sync_data(background_tasks: BackgroundTasks):
@@ -108,6 +117,16 @@ async def get_exchange_keys(db: AsyncSession = Depends(get_db)):
 
 @router.post("/keys", response_model=ExchangeKeyResponse)
 async def create_exchange_key(key_data: ExchangeKeyCreate, db: AsyncSession = Depends(get_db)):
+    # Check if a placeholder for this exchange already exists
+    if not key_data.api_key:
+        stmt = select(ExchangeKeyModel).filter(
+            ExchangeKeyModel.exchange_name == key_data.exchange_name.lower(),
+            ExchangeKeyModel.api_key == None
+        )
+        existing = (await db.execute(stmt)).scalars().first()
+        if existing:
+            return existing
+
     new_key = ExchangeKeyModel(
         exchange_name=key_data.exchange_name.lower(),
         api_key=key_data.api_key,
@@ -179,7 +198,7 @@ async def get_data_sources(db: AsyncSession = Depends(get_db)):
     return [{"exchange": k, **v} for k, v in stats.items()]
 
 @router.delete("/data-sources/{exchange_name}")
-async def delete_data_source(exchange_name: str, db: AsyncSession = Depends(get_db)):
+async def delete_data_source(exchange_name: str, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     from sqlalchemy import delete
     
     # 1. Delete transactions
@@ -200,14 +219,16 @@ async def delete_data_source(exchange_name: str, db: AsyncSession = Depends(get_
                 f.writelines(new_lines)
     except: pass
     
-    # 4. Commit and Recalculate
+    # 4. Commit
     await db.commit()
-    await tax_engine.calculate_taxes(db)
+
+    # 5. Recalculate in background
+    background_tasks.add_task(run_sync_and_calculate_background)
     
     return {"status": "deleted"}
 
 @router.delete("/keys/{key_id}")
-async def delete_exchange_key(key_id: int, db: AsyncSession = Depends(get_db)):
+async def delete_exchange_key(key_id: int, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(ExchangeKeyModel).filter(ExchangeKeyModel.id == key_id))
     key = result.scalars().first()
     if not key:
@@ -215,7 +236,25 @@ async def delete_exchange_key(key_id: int, db: AsyncSession = Depends(get_db)):
     
     # When deleting a key, we also delete all data for that exchange as requested
     exchange_name = key.exchange_name
-    await delete_data_source(exchange_name, db)
+    
+    # Logic from delete_data_source but combined here to use same background_tasks
+    from sqlalchemy import delete
+    await db.execute(delete(TransactionModel).filter(TransactionModel.exchange == exchange_name))
+    await db.execute(delete(ExchangeKeyModel).filter(ExchangeKeyModel.id == key_id))
+    
+    try:
+        env_path = ".env"
+        prefix = exchange_name.upper()
+        if os.path.exists(env_path):
+            with open(env_path, "r") as f:
+                lines = f.readlines()
+            new_lines = [l for l in lines if not l.startswith(f"{prefix}_API_")]
+            with open(env_path, "w") as f:
+                f.writelines(new_lines)
+    except: pass
+
+    await db.commit()
+    background_tasks.add_task(run_sync_and_calculate_background)
     
     return {"status": "deleted"}
 

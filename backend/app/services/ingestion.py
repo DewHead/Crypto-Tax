@@ -3,12 +3,17 @@ from app.core.config import settings
 from app.models.transaction import Transaction, TransactionType
 from app.models.exchange_key import ExchangeKey
 from app.db.session import AsyncSessionLocal
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import asyncio
 
 class IngestionService:
+    def __init__(self):
+        self._sync_lock = asyncio.Lock()
+        self._pending_transactions: List[Transaction] = []
+
     async def sync_env_keys(self):
         async with AsyncSessionLocal() as db:
             exchanges = {
@@ -39,26 +44,37 @@ class IngestionService:
             print("Reset all sync statuses.")
 
     async def sync_all(self):
-        await self.sync_env_keys()
-        async with AsyncSessionLocal() as db:
-            result = await db.execute(select(ExchangeKey))
-            keys = result.scalars().all()
-            for key in keys: key.is_syncing = 1
-            await db.commit()
-        tasks = []
-        for key in keys: tasks.append(self.sync_one(key.id))
-        try:
-            if tasks: await asyncio.gather(*tasks)
-        finally:
+        async with self._sync_lock:
+            await self.sync_env_keys()
             async with AsyncSessionLocal() as db:
                 result = await db.execute(select(ExchangeKey))
                 keys = result.scalars().all()
-                for key in keys:
-                    key.is_syncing = 0
-                    key.last_sync_at = datetime.now(timezone.utc)
+                for key in keys: key.is_syncing = 1
                 await db.commit()
+            
+            tasks = []
+            for key in keys: tasks.append(self.sync_one(key.id, use_lock=False))
+            try:
+                if tasks: await asyncio.gather(*tasks)
+            finally:
+                async with AsyncSessionLocal() as db:
+                    result = await db.execute(select(ExchangeKey))
+                    keys = result.scalars().all()
+                    for key in keys:
+                        key.is_syncing = 0
+                        key.last_sync_at = datetime.now(timezone.utc)
+                    await db.commit()
 
-    async def sync_one(self, key_id: int):
+    async def sync_one(self, key_id: int, use_lock: bool = True):
+        lock_context = self._sync_lock if use_lock else asyncio.Lock() # Dummy lock if already locked
+        if not use_lock:
+            # If we are already under a lock (from sync_all), just proceed
+            return await self._sync_one_internal(key_id)
+        
+        async with self._sync_lock:
+            return await self._sync_one_internal(key_id)
+
+    async def _sync_one_internal(self, key_id: int):
         async with AsyncSessionLocal() as db:
             result = await db.execute(select(ExchangeKey).filter(ExchangeKey.id == key_id))
             key = result.scalars().first()
@@ -75,24 +91,39 @@ class IngestionService:
                     'secret': key.api_secret,
                     'enableRateLimit': True,
                 })
-                await self.sync_exchange(key.exchange_name, exchange_instance)
+                await self.sync_exchange(key.exchange_name, exchange_instance, db=db)
                 await exchange_instance.close()
             except Exception as e:
                 print(f"Error syncing {key.exchange_name}: {e}")
             finally:
-                async with AsyncSessionLocal() as db:
-                    result = await db.execute(select(ExchangeKey).filter(ExchangeKey.id == key_id))
+                async with AsyncSessionLocal() as db_final:
+                    result = await db_final.execute(select(ExchangeKey).filter(ExchangeKey.id == key_id))
                     key = result.scalars().first()
                     if key:
                         key.is_syncing = 0
                         key.last_sync_at = datetime.now(timezone.utc)
-                        await db.commit()
+                        await db_final.commit()
 
-    async def sync_exchange(self, name: str, exchange: ccxt.Exchange):
+    async def sync_exchange(self, name: str, exchange: ccxt.Exchange, db: Optional[AsyncSession] = None):
         try:
             await exchange.load_markets()
             assets = set()
             
+            # Use a buffer for transactions and commit in batches
+            tx_buffer = []
+            async def flush_buffer():
+                if tx_buffer:
+                    if db:
+                        for tx in tx_buffer:
+                            await self._save_to_db(tx, db, commit=False)
+                        await db.commit()
+                    else:
+                        async with AsyncSessionLocal() as session:
+                            for tx in tx_buffer:
+                                await self._save_to_db(tx, session, commit=False)
+                            await session.commit()
+                    tx_buffer.clear()
+
             # 1. Deposits & Withdrawals (Discovery)
             if exchange.has['fetchDeposits']:
                 try:
@@ -109,7 +140,8 @@ class IngestionService:
                                 fee_amount=d['fee']['cost'] if d.get('fee') else 0.0,
                                 is_taxable_event=0, source='api'
                             )
-                            await self._save_transaction(tx)
+                            tx_buffer.append(tx)
+                            if len(tx_buffer) >= 50: await flush_buffer()
                 except: pass
 
             if exchange.has['fetchWithdrawals']:
@@ -127,13 +159,17 @@ class IngestionService:
                                 fee_amount=w['fee']['cost'] if w.get('fee') else 0.0,
                                 is_taxable_event=0, source='api'
                             )
-                            await self._save_transaction(tx)
+                            tx_buffer.append(tx)
+                            if len(tx_buffer) >= 50: await flush_buffer()
                 except: pass
 
             # 2. Special Histories (Discovery)
             if name.lower() == 'binance':
-                found_assets = await self._sync_binance_special(exchange, assets)
+                # Binance special history methods also need to be updated to use a buffer or similar
+                # For now, let's pass a custom callback to them or just let them use the buffer
+                found_assets = await self._sync_binance_special(exchange, assets, db=db, tx_buffer=tx_buffer)
                 assets.update(found_assets)
+                await flush_buffer()
 
             # 3. Current Balance (Discovery)
             try:
@@ -150,12 +186,18 @@ class IngestionService:
                         print(f"Fetching all trades for {name} with pagination...")
                         trades = await self._fetch_all_my_trades(exchange, symbol=None, since=since)
                         print(f"Found {len(trades)} total trades for {name}")
-                        for t in trades: await self._process_trade(name, exchange, t)
+                        for t in trades:
+                            tx = await self._process_trade_to_tx(name, exchange, t)
+                            if tx: tx_buffer.append(tx)
+                            if len(tx_buffer) >= 50: await flush_buffer()
+                        
+                        await flush_buffer()
                         print(f"Syncing ledger for {name}...")
                         if name.lower() == 'krakenfutures':
-                            await self._sync_krakenfutures_ledger(exchange, since=since)
+                            await self._sync_krakenfutures_ledger(exchange, since=since, db=db, tx_buffer=tx_buffer)
                         else:
-                            await self._sync_kraken_ledger(exchange, name=name, since=since)
+                            await self._sync_kraken_ledger(exchange, name=name, since=since, db=db, tx_buffer=tx_buffer)
+                        await flush_buffer()
                     else:
                         # Narrow symbol search but ensure common quotes are included
                         discovery_assets = assets.copy()
@@ -163,26 +205,21 @@ class IngestionService:
                         symbols_to_check = []
                         for s in exchange.markets.keys():
                             m = exchange.market(s)
-                            # Check symbols where base is an asset we know about
                             if m['base'] in discovery_assets:
                                 symbols_to_check.append(s)
                         
-                        print(f"Checking {len(symbols_to_check)} relevant symbols for trades on {name} in parallel...")
-                        semaphore = asyncio.Semaphore(10) 
-                        async def fetch_trades_safe(symbol):
-                            async with semaphore:
-                                try: return await self._fetch_all_my_trades(exchange, symbol, since=since)
-                                except: return []
-                        tasks = [fetch_trades_safe(s) for s in symbols_to_check]
-                        results = await asyncio.gather(*tasks)
-                        total_found = 0
-                        for trades in results:
-                            if trades:
-                                total_found += len(trades)
-                                for t in trades: await self._process_trade(name, exchange, t)
-                        print(f"Finished relevant symbol check for {name}. Total trades found: {total_found}")
+                        print(f"Checking {len(symbols_to_check)} relevant symbols for trades on {name}...")
+                        for s in symbols_to_check:
+                            trades = await self._fetch_all_my_trades(exchange, s, since=since)
+                            for t in trades:
+                                tx = await self._process_trade_to_tx(name, exchange, t)
+                                if tx: tx_buffer.append(tx)
+                                if len(tx_buffer) >= 50: await flush_buffer()
+                        await flush_buffer()
                 except Exception as e:
                     print(f"Error fetching trades for {name}: {e}")
+            
+            await flush_buffer()
         except Exception as e:
             print(f"Critical error syncing {name}: {e}")
 
@@ -208,7 +245,7 @@ class IngestionService:
                 if len(trades) < 5: break
         return all_trades
 
-    async def _sync_kraken_ledger(self, exchange: ccxt.Exchange, name: str = 'kraken', since: int = None):
+    async def _sync_kraken_ledger(self, exchange: ccxt.Exchange, name: str = 'kraken', since: int = None, db: Optional[AsyncSession] = None, tx_buffer: List[Transaction] = None):
         try:
             print(f"Syncing {name} ledger since {since}...")
             all_ledger = []
@@ -241,7 +278,8 @@ class IngestionService:
                         fee_amount=entry['fee']['cost'] if entry.get('fee') else 0.0,
                         is_taxable_event=0, source='api'
                     )
-                    await self._save_transaction(tx)
+                    if tx_buffer is not None: tx_buffer.append(tx)
+                    else: await self._save_transaction(tx, db=db)
                 elif etype in ['staking', 'earn', 'reward']:
                     tx = Transaction(
                         exchange=name, tx_hash=entry['id'],
@@ -253,10 +291,9 @@ class IngestionService:
                         is_taxable_event=0, source='api',
                         category=etype.capitalize()
                     )
-                    await self._save_transaction(tx)
+                    if tx_buffer is not None: tx_buffer.append(tx)
+                    else: await self._save_transaction(tx, db=db)
                 elif etype in ['margin', 'rollover']:
-                    # Realized Margin P&L in Kraken ledger is usually 'margin' type with positive/negative amount
-                    is_pnl = (etype == 'margin')
                     tx = Transaction(
                         exchange=name, tx_hash=entry['id'],
                         timestamp=datetime.fromtimestamp(entry['timestamp'] / 1000.0),
@@ -269,7 +306,8 @@ class IngestionService:
                         fee_amount=abs(entry['amount']) if etype == 'rollover' else 0.0,
                         is_taxable_event=1, source='api'
                     )
-                    await self._save_transaction(tx)
+                    if tx_buffer is not None: tx_buffer.append(tx)
+                    else: await self._save_transaction(tx, db=db)
 
             for refid, entries in trades_by_refid.items():
                 if len(entries) >= 2:
@@ -287,20 +325,18 @@ class IngestionService:
                             is_taxable_event=1 if out_entry['currency'] not in ['USD', 'EUR', 'ILS'] else 0,
                             source='api'
                         )
-                        await self._save_transaction(tx)
+                        if tx_buffer is not None: tx_buffer.append(tx)
+                        else: await self._save_transaction(tx, db=db)
         except Exception as e:
             print(f"Error syncing {name} ledger: {e}")
 
-    async def _sync_krakenfutures_ledger(self, exchange: ccxt.Exchange, since: int = None):
+    async def _sync_krakenfutures_ledger(self, exchange: ccxt.Exchange, since: int = None, db: Optional[AsyncSession] = None, tx_buffer: List[Transaction] = None):
         try:
             print(f"Syncing krakenfutures ledger...")
-            # Kraken Futures uses history_get_account_log
             res = await exchange.history_get_account_log()
             logs = res.get('logs', [])
             
             for l in logs:
-                # date format: 2025-09-30T08:06:52.772Z
-                # Handle cases where micro/milliseconds might be missing or different
                 date_str = l['date']
                 try:
                     if '.' in date_str:
@@ -308,7 +344,6 @@ class IngestionService:
                     else:
                         ts = datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
                 except Exception:
-                    # Fallback to general isoformat parsing if possible, or skip
                     continue
 
                 if since and ts.timestamp() * 1000 < since:
@@ -324,10 +359,7 @@ class IngestionService:
                 fee = float(l.get('fee') or 0) + float(l.get('liquidation_fee') or 0)
                 
                 if info in ['futures trade', 'futures liquidation', 'funding rate change']:
-                    # If it's a 'futures trade', it might be a position open/close which CCXT fetchMyTrades also catches.
-                    # We only want the REALIZED P&L from the ledger.
-                    is_taxable = (info != 'futures trade') # Only funding and liquidations are P&L in ledger
-                    
+                    is_taxable = (info != 'futures trade')
                     if amount != 0 or fee != 0:
                         tx = Transaction(
                             exchange='krakenfutures', tx_hash=l['booking_uid'],
@@ -341,7 +373,8 @@ class IngestionService:
                             is_taxable_event=1 if is_taxable else 0, source='api',
                             raw_data=str(l)
                         )
-                        await self._save_transaction(tx)
+                        if tx_buffer is not None: tx_buffer.append(tx)
+                        else: await self._save_transaction(tx, db=db)
                 elif info == 'cross-exchange transfer':
                     old_bal = float(l.get('old_balance') or 0)
                     new_bal = float(l.get('new_balance') or 0)
@@ -359,22 +392,23 @@ class IngestionService:
                             is_taxable_event=0, source='api',
                             raw_data=str(l)
                         )
-                        await self._save_transaction(tx)
+                        if tx_buffer is not None: tx_buffer.append(tx)
+                        else: await self._save_transaction(tx, db=db)
         except Exception as e:
             print(f"Error syncing krakenfutures ledger: {e}")
 
-    async def _process_trade(self, name: str, exchange: ccxt.Exchange, t: Dict[str, Any]):
+    async def _process_trade_to_tx(self, name: str, exchange: ccxt.Exchange, t: Dict[str, Any]) -> Optional[Transaction]:
         try:
             if name.lower().startswith('kraken'):
-                # Check for margin on Kraken Spot or any trade on Kraken Futures
-                leverage = int(t['info'].get('leverage', 0))
+                info = t.get('info', {})
+                leverage = int(info.get('leverage', 0))
                 if leverage > 0 or name.lower() == 'krakenfutures':
-                    return # Skip margin/futures trades, they are handled via ledger P&L entries
+                    return None
             
             market = exchange.market(t['symbol'])
             base = market['base']; quote = market['quote']; side = t['side'].lower()
             if side == 'buy':
-                tx = Transaction(
+                return Transaction(
                     exchange=name, tx_hash=t['id'], timestamp=datetime.fromtimestamp(t['timestamp'] / 1000.0),
                     type=TransactionType.buy, asset_from=quote, amount_from=t['cost'],
                     asset_to=base, amount_to=t['amount'],
@@ -383,7 +417,7 @@ class IngestionService:
                     is_taxable_event=0, source='api'
                 )
             else: # sell
-                tx = Transaction(
+                return Transaction(
                     exchange=name, tx_hash=t['id'], timestamp=datetime.fromtimestamp(t['timestamp'] / 1000.0),
                     type=TransactionType.sell, asset_from=base, amount_from=t['amount'],
                     asset_to=quote, amount_to=t['cost'],
@@ -391,18 +425,20 @@ class IngestionService:
                     fee_amount=t['fee']['cost'] if t.get('fee') else 0.0,
                     is_taxable_event=1, source='api'
                 )
-            await self._save_transaction(tx)
-        except: pass
+        except: return None
 
-    async def _sync_binance_special(self, exchange: ccxt.Exchange, assets: set):
+    async def _sync_binance_special(self, exchange: ccxt.Exchange, assets: set, db: Optional[AsyncSession] = None, tx_buffer: List[Transaction] = None):
         discovered_assets = set()
         end_time = int(datetime.now().timestamp() * 1000)
         chunk_ms = 30 * 24 * 60 * 60 * 1000
         wall_time = int(datetime(2017, 1, 1).timestamp() * 1000)
         
+        async def add_tx(tx):
+            if tx_buffer is not None: tx_buffer.append(tx)
+            else: await self._save_transaction(tx, db=db)
+
         # 1. Convert
         try:
-            print("Syncing Binance Convert history...")
             current_end = end_time
             while current_end > wall_time:
                 current_start = max(current_end - chunk_ms, wall_time)
@@ -416,13 +452,13 @@ class IngestionService:
                         asset_to=c['toAsset'], amount_to=float(c['toAmount']), fee_asset=None, fee_amount=0.0,
                         is_taxable_event=1, source='api', category='Convert'
                     )
-                    await self._save_transaction(tx)
+                    await add_tx(tx)
                 current_end = current_start
+                if not records: break
         except: pass
 
         # 2. Dust
         try:
-            print("Syncing Binance Dust log...")
             current_end = end_time
             while current_end > wall_time:
                 current_start = max(current_end - chunk_ms, wall_time)
@@ -438,13 +474,13 @@ class IngestionService:
                             fee_asset='BNB', fee_amount=float(detail.get('serviceChargeAmount', 0)),
                             is_taxable_event=1, source='api', category='Dust'
                         )
-                        await self._save_transaction(tx)
+                        await add_tx(tx)
                 current_end = current_start
+                if not userAssetDribblets: break
         except: pass
 
         # 3. Simple Earn
         try:
-            print("Syncing Binance Simple Earn history...")
             current_end = end_time
             while current_end > wall_time:
                 current_start = max(current_end - chunk_ms, wall_time)
@@ -464,7 +500,7 @@ class IngestionService:
                                     asset_to=r['asset'], amount_to=float(r['amount']), fee_asset=None, fee_amount=0.0,
                                     is_taxable_event=0, source='api', category='Earn'
                                 )
-                                await self._save_transaction(tx)
+                                await add_tx(tx)
                             if len(records) < 100: break
                             page += 1
                         except: break
@@ -473,74 +509,81 @@ class IngestionService:
 
         # 4. Dividends (Generic Rewards)
         try:
-             print("Syncing Binance Dividend history...")
              current_end = end_time
              while current_end > wall_time:
                  current_start = max(current_end - (90 * 24 * 60 * 60 * 1000), wall_time)
-                 # Use smaller chunks for dividends to avoid missing data
                  response = await exchange.sapi_get_asset_assetdividend({'startTime': current_start, 'endTime': current_end, 'limit': 500})
                  rows = response.get('rows', [])
-                 if rows:
-                     for r in rows:
-                         discovered_assets.add(r['asset'])
-                         tx = Transaction(
-                            exchange='binance', tx_hash=f"div_{r['divTime']}_{r['asset']}", timestamp=datetime.fromtimestamp(float(r['divTime']) / 1000.0),
-                            type=TransactionType.earn, asset_from=None, amount_from=0.0,
-                            asset_to=r['asset'], amount_to=float(r['amount']), fee_asset=None, fee_amount=0.0,
-                            is_taxable_event=0, source='api', category='Earn'
-                        )
-                         await self._save_transaction(tx)
+                 for r in rows:
+                     discovered_assets.add(r['asset'])
+                     tx = Transaction(
+                        exchange='binance', tx_hash=f"div_{r['divTime']}_{r['asset']}", timestamp=datetime.fromtimestamp(float(r['divTime']) / 1000.0),
+                        type=TransactionType.earn, asset_from=None, amount_from=0.0,
+                        asset_to=r['asset'], amount_to=float(r['amount']), fee_asset=None, fee_amount=0.0,
+                        is_taxable_event=0, source='api', category='Earn'
+                    )
+                     await add_tx(tx)
                  current_end = current_start
+                 if not rows: break
         except: pass
 
         # 5. Fiat
         try:
-            print("Syncing Binance Fiat history...")
             for transaction_type in [0, 1]:
                 current_end = end_time
                 while current_end > wall_time:
                     current_start = max(current_end - (90 * 24 * 60 * 60 * 1000), wall_time)
                     response = await exchange.sapi_get_fiat_orders({'transactionType': transaction_type, 'beginTime': current_start, 'endTime': current_end})
                     data = response.get('data', [])
-                    if data:
-                        for f in data:
-                            if f['status'].lower() == 'completed':
-                                discovered_assets.add(f['fiatCurrency']); discovered_assets.add(f['cryptoCurrency'])
-                                tx = Transaction(
-                                    exchange='binance', tx_hash=str(f['orderNo']), timestamp=datetime.fromtimestamp(float(f['createTime']) / 1000.0),
-                                    type=TransactionType.buy if transaction_type == 0 else TransactionType.sell,
-                                    asset_from=f['fiatCurrency'] if transaction_type == 0 else f['cryptoCurrency'],
-                                    amount_from=float(f['amount']) if transaction_type == 0 else float(f['obtainAmount']),
-                                    asset_to=f['cryptoCurrency'] if transaction_type == 0 else f['fiatCurrency'],
-                                    amount_to=float(f['obtainAmount']) if transaction_type == 0 else float(f['amount']),
-                                    fee_asset=f['fiatCurrency'], fee_amount=float(f['totalFee']),
-                                    is_taxable_event=1 if transaction_type == 1 else 0, source='api'
-                                )
-                                await self._save_transaction(tx)
+                    for f in data:
+                        if f['status'].lower() == 'completed':
+                            discovered_assets.add(f['fiatCurrency']); discovered_assets.add(f['cryptoCurrency'])
+                            tx = Transaction(
+                                exchange='binance', tx_hash=str(f['orderNo']), timestamp=datetime.fromtimestamp(float(f['createTime']) / 1000.0),
+                                type=TransactionType.buy if transaction_type == 0 else TransactionType.sell,
+                                asset_from=f['fiatCurrency'] if transaction_type == 0 else f['cryptoCurrency'],
+                                amount_from=float(f['amount']) if transaction_type == 0 else float(f['obtainAmount']),
+                                asset_to=f['cryptoCurrency'] if transaction_type == 0 else f['fiatCurrency'],
+                                amount_to=float(f['obtainAmount']) if transaction_type == 0 else float(f['amount']),
+                                fee_asset=f['fiatCurrency'], fee_amount=float(f['totalFee']),
+                                is_taxable_event=1 if transaction_type == 1 else 0, source='api'
+                            )
+                            await add_tx(tx)
                     current_end = current_start
+                    if not data: break
         except: pass
         return discovered_assets
 
-    async def _save_transaction(self, tx: Transaction):
-        async with AsyncSessionLocal() as db:
-            try:
-                if tx.tx_hash and not tx.tx_hash.startswith('csv_'):
-                    stmt = select(Transaction).filter(Transaction.tx_hash == tx.tx_hash, Transaction.exchange == tx.exchange)
-                    result = await db.execute(stmt)
-                    if result.scalars().first(): return
-                t_start = tx.timestamp - timedelta(seconds=1)
-                t_end = tx.timestamp + timedelta(seconds=1)
-                stmt = select(Transaction).filter(
-                    Transaction.exchange == tx.exchange, Transaction.asset_from == tx.asset_from, Transaction.amount_from == tx.amount_from,
-                    Transaction.asset_to == tx.asset_to, Transaction.amount_to == tx.amount_to, Transaction.timestamp.between(t_start, t_end)
-                )
+    async def _save_transaction(self, tx: Transaction, db: Optional[AsyncSession] = None):
+        if db:
+            await self._save_to_db(tx, db)
+        else:
+            async with AsyncSessionLocal() as session:
+                await self._save_to_db(tx, session)
+
+    async def _save_to_db(self, tx: Transaction, db: AsyncSession, commit: bool = True):
+        try:
+            if tx.tx_hash and not tx.tx_hash.startswith('csv_'):
+                stmt = select(Transaction).filter(Transaction.tx_hash == tx.tx_hash, Transaction.exchange == tx.exchange)
                 result = await db.execute(stmt)
-                if not result.scalars().first():
-                    db.add(tx); await db.commit()
-                elif tx.source == 'api' and result.scalars().first().source == 'csv':
-                    existing = result.scalars().first()
-                    existing.tx_hash = tx.tx_hash; existing.source = 'api'; existing.raw_data = tx.raw_data
-                    await db.commit()
-            except: await db.rollback()
+                if result.scalars().first(): return
+            
+            t_start = tx.timestamp - timedelta(seconds=1)
+            t_end = tx.timestamp + timedelta(seconds=1)
+            stmt = select(Transaction).filter(
+                Transaction.exchange == tx.exchange, Transaction.asset_from == tx.asset_from, Transaction.amount_from == tx.amount_from,
+                Transaction.asset_to == tx.asset_to, Transaction.amount_to == tx.amount_to, Transaction.timestamp.between(t_start, t_end)
+            )
+            result = await db.execute(stmt)
+            existing = result.scalars().first()
+            if not existing:
+                db.add(tx)
+                if commit: await db.commit()
+            elif tx.source == 'api' and existing.source == 'csv':
+                existing.tx_hash = tx.tx_hash; existing.source = 'api'; existing.raw_data = tx.raw_data
+                if commit: await db.commit()
+        except:
+            if commit: await db.rollback()
+            raise
 
 ingestion_service = IngestionService()

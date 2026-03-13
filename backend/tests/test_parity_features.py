@@ -180,7 +180,8 @@ async def test_delete_data_source():
         
         # Call the deletion logic (we can call the endpoint directly or the logic)
         from app.api.endpoints import delete_data_source
-        await delete_data_source('mock_ex', db)
+        from fastapi import BackgroundTasks
+        await delete_data_source('mock_ex', BackgroundTasks(), db=db)
         
         # Verify they are gone
         assert (await db.execute(select(Transaction).filter(Transaction.exchange == 'mock_ex'))).scalars().first() is None

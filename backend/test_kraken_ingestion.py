@@ -1,15 +1,26 @@
 import asyncio
 import os
 import sys
+import pytest
 
 # Add the backend directory to sys.path to import app modules
 sys.path.append(os.path.join(os.getcwd(), 'backend'))
 
 from app.services.ingestion import IngestionService
-from app.db.session import AsyncSessionLocal
+import pytest_asyncio
+from app.db.session import AsyncSessionLocal, engine, Base
 from app.models.transaction import Transaction
 from sqlalchemy import select, func
 
+@pytest_asyncio.fixture(autouse=True)
+async def setup_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+
+@pytest.mark.asyncio
 async def test_kraken_sync():
     service = IngestionService()
     

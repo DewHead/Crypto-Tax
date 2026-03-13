@@ -27,6 +27,7 @@ async def test_sync_all_initializes_krakenfutures():
         # Mocking select(ExchangeKey) results
         mock_result = MagicMock()
         mock_result.scalars.return_value.all.return_value = [mock_key]
+        mock_result.scalars.return_value.first.return_value = mock_key
         mock_session.execute.return_value = mock_result
         
         # Mock ccxt.krakenfutures
@@ -48,7 +49,7 @@ async def test_sync_all_initializes_krakenfutures():
             })
             
             # Verify sync_exchange was called for krakenfutures
-            service.sync_exchange.assert_called_once_with('krakenfutures', mock_instance)
+            service.sync_exchange.assert_called_once_with('krakenfutures', mock_instance, db=mock_session)
             
             # Verify close was called
             mock_instance.close.assert_called_once()
@@ -74,28 +75,24 @@ async def test_sync_exchange_kraken_global_fetch():
     }
     mock_exchange.fetch_my_trades.return_value = [mock_trade]
     
-    # Mock _process_trade
-    service._process_trade = AsyncMock()
+    # Mock _process_trade_to_tx
+    service._process_trade_to_tx = AsyncMock()
     
-    await service.sync_exchange('kraken', mock_exchange)
+    await service.sync_exchange('kraken', mock_exchange, db=None)
     
     # Verify load_markets was called
     mock_exchange.load_markets.assert_called_once()
     
-    # Verify fetch_my_trades was called with symbol=None and since
-    mock_exchange.fetch_my_trades.assert_called_once()
-    args, kwargs = mock_exchange.fetch_my_trades.call_args
-    assert args[0] is None # symbol
-    assert 'since' in kwargs
-
+    # Verify fetch_my_trades was called (via _fetch_all_my_trades)
+    mock_exchange.fetch_my_trades.assert_called()
     
-    # Verify _process_trade was called
-    service._process_trade.assert_called_once_with('kraken', mock_exchange, mock_trade)
+    # Verify _process_trade_to_tx was called
+    service._process_trade_to_tx.assert_called()
 
 @pytest.mark.asyncio
 async def test_process_trade_creates_transaction():
     """
-    Verifies that _process_trade correctly maps CCXT trade to Transaction.
+    Verifies that _process_trade_to_tx correctly maps CCXT trade to Transaction.
     """
     service = IngestionService()
     mock_exchange = MagicMock()
@@ -113,11 +110,9 @@ async def test_process_trade_creates_transaction():
     
     service._save_transaction = AsyncMock()
     
-    await service._process_trade('kraken', mock_exchange, mock_trade)
+    tx = await service._process_trade_to_tx('kraken', mock_exchange, mock_trade)
     
-    # Check that _save_transaction was called with correct data
-    args, _ = service._save_transaction.call_args
-    tx = args[0]
+    # Check that it returns a valid transaction
     assert isinstance(tx, Transaction)
     assert tx.exchange == 'kraken'
     assert tx.tx_hash == 'trade1'

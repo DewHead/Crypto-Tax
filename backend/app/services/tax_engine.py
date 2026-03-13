@@ -105,34 +105,38 @@ class TaxLedger:
         })
 
 class TaxEngine:
+    def __init__(self):
+        self._lock = asyncio.Lock()
+
     async def calculate_taxes(self, db: AsyncSession, use_wash_sale_rule: bool = False):
-        # 0. Clean up previous calculations
-        await db.execute(delete(TaxLotConsumption))
-        
-        # 1. Fetch all transactions
-        txs_stmt = select(Transaction).order_by(Transaction.timestamp.asc())
-        result = await db.execute(txs_stmt)
-        all_txs = result.scalars().all()
-        
-        if not all_txs:
-            return
+        async with self._lock:
+            # 0. Clean up previous calculations
+            await db.execute(delete(TaxLotConsumption))
+            
+            # 1. Fetch all transactions
+            txs_stmt = select(Transaction).order_by(Transaction.timestamp.asc())
+            result = await db.execute(txs_stmt)
+            all_txs = result.scalars().all()
+            
+            if not all_txs:
+                return
 
-        # Phase 1: Pre-Processing & Classification
-        await self._run_avalanche_merger(all_txs, db)
-        reconciled_ids = await self._run_transfer_reconciliation(all_txs, db)
-        
-        # Filter active transactions for Phase 2 and 3
-        active_txs = [t for t in all_txs if t.is_active]
+            # Phase 1: Pre-Processing & Classification
+            await self._run_avalanche_merger(all_txs, db)
+            reconciled_ids = await self._run_transfer_reconciliation(all_txs, db)
+            
+            # Filter active transactions for Phase 2 and 3
+            active_txs = [t for t in all_txs if t.is_active]
 
-        # Phase 2: Valuation (Pricing everything to ILS)
-        await self._run_valuation(active_txs, db)
-        
-        # Phase 3: The FIFO Ledger
-        ledger = TaxLedger(db)
-        for tx in active_txs:
-            await self._process_transaction(tx, ledger, reconciled_ids, db, use_wash_sale_rule=use_wash_sale_rule)
+            # Phase 2: Valuation (Pricing everything to ILS)
+            await self._run_valuation(active_txs, db)
+            
+            # Phase 3: The FIFO Ledger
+            ledger = TaxLedger(db)
+            for tx in active_txs:
+                await self._process_transaction(tx, ledger, reconciled_ids, db, use_wash_sale_rule=use_wash_sale_rule)
 
-        await db.commit()
+            await db.commit()
 
     async def _run_avalanche_merger(self, txs: List[Transaction], db: AsyncSession):
         i = 0
@@ -154,9 +158,9 @@ class TaxEngine:
                     nxt.asset_to == curr.asset_to and 
                     time_diff <= 5):
                     
-                    curr.amount_from += nxt.amount_from
-                    curr.amount_to += nxt.amount_to
-                    curr.fee_amount += nxt.fee_amount
+                    curr.amount_from = (curr.amount_from or 0.0) + (nxt.amount_from or 0.0)
+                    curr.amount_to = (curr.amount_to or 0.0) + (nxt.amount_to or 0.0)
+                    curr.fee_amount = (curr.fee_amount or 0.0) + (nxt.fee_amount or 0.0)
                     
                     nxt.is_active = False
                     nxt.parent_tx_id = curr.id
@@ -184,7 +188,9 @@ class TaxEngine:
                 if 0 <= time_diff <= 86400: # 24 hours
                     if d.asset_to == w.asset_from:
                         # Heuristic: 5% fee variance
-                        if d.amount_to <= w.amount_from and d.amount_to >= (w.amount_from * 0.95):
+                        d_amt = d.amount_to or 0.0
+                        w_amt = w.amount_from or 0.0
+                        if d_amt <= w_amt and d_amt >= (w_amt * 0.95):
                             w.is_taxable_event = 0
                             d.is_taxable_event = 0
                             w.linked_transaction_id = d.id
@@ -196,7 +202,7 @@ class TaxEngine:
                             reconciled_ids.add(d.id)
                             
                             # Log transfer fee if any
-                            fee_amount = w.amount_from - d.amount_to
+                            fee_amount = w_amt - d_amt
                             if fee_amount > 1e-10:
                                 w.issue_notes = (w.issue_notes or "") + f" | Transfer fee: {fee_amount} {w.asset_from}"
                             break
@@ -207,14 +213,14 @@ class TaxEngine:
         
         min_date = txs[0].timestamp.date()
         max_date = txs[-1].timestamp.date()
-        await boi_service.prefetch_rates(min_date, max_date)
+        await boi_service.prefetch_rates(min_date, max_date, db=db)
         
         rate_cache: Dict[date, float] = {}
 
         for tx in txs:
             rate_date = tx.timestamp.date()
             if rate_date not in rate_cache:
-                rate_cache[rate_date] = await boi_service.get_usd_ils_rate(rate_date)
+                rate_cache[rate_date] = await boi_service.get_usd_ils_rate(rate_date, db=db)
             
             tx.ils_exchange_rate = rate_cache[rate_date]
             tx.ils_rate_date = rate_date
@@ -224,12 +230,15 @@ class TaxEngine:
             return 0.0
         if asset == 'ILS':
             return amount
+            
+        rate = usd_ils_rate or 3.65
+        
         if asset in ['USD', 'USDT', 'USDC', 'BUSD', 'DAI']:
-            return amount * usd_ils_rate
+            return amount * rate
         
         usd_price = await price_service.get_historical_price(asset, tx_date)
         if usd_price is not None:
-            val = amount * usd_price * usd_ils_rate
+            val = amount * usd_price * rate
             logger.info(f"Price: {asset} on {tx_date} is ${usd_price}, ILS value: {val}")
             return val
         
@@ -243,16 +252,18 @@ class TaxEngine:
         tx.ordinary_income_ils = 0.0
         tx.is_taxable_event = 0
 
-        rate = tx.ils_exchange_rate
+        rate = tx.ils_exchange_rate or 3.65
         tx_date = tx.timestamp.date()
 
         # 1. Handle Kraken Futures PnL (Special Case)
         if tx.exchange == 'krakenfutures' and tx.type in [TransactionType.fee, TransactionType.earn] and (tx.asset_from in ['USD', 'BTC', 'XBT'] or tx.asset_to in ['USD', 'BTC', 'XBT']):
-            pnl_amount = tx.amount_to if tx.amount_to > 0 else -tx.amount_from
+            tx_amt_to = tx.amount_to or 0.0
+            tx_amt_from = tx.amount_from or 0.0
+            pnl_amount = tx_amt_to if tx_amt_to > 0 else -tx_amt_from
             tx.capital_gain_ils = pnl_amount * rate
             tx.is_taxable_event = 1
-            if tx.amount_to > 0:
-                ledger.add_lot(tx.asset_to, tx.amount_to, tx.capital_gain_ils, tx)
+            if tx_amt_to > 0:
+                ledger.add_lot(tx.asset_to, tx_amt_to, tx.capital_gain_ils, tx)
             return
 
         # Pre-calculate values
@@ -260,7 +271,7 @@ class TaxEngine:
         amt_to = tx.amount_to or 0.0
         val_from = await self.get_ils_value(tx.asset_from, amt_from, tx_date, rate)
         val_to = await self.get_ils_value(tx.asset_to, amt_to, tx_date, rate)
-        fee_ils = await self.get_ils_value(tx.fee_asset, tx.fee_amount, tx_date, rate)
+        fee_ils = await self.get_ils_value(tx.fee_asset, tx.fee_amount or 0.0, tx_date, rate)
 
         # For swaps, we use fiat value if available, otherwise FMV of acquired/disposed asset.
         if tx.asset_from in ['USD', 'ILS']:
@@ -281,8 +292,7 @@ class TaxEngine:
                 cost_basis = await ledger.consume_lots(asset, qty, tx) if not is_fiat else 0.0
 
                 # Valuation of proceeds: If swap, use effective_swap_value
-                # Subtract the fee from proceeds
-                proceeds = (effective_swap_value if amt_to > 0 else val_from) - fee_ils
+                proceeds = (effective_swap_value if amt_to > 0 else val_from)
 
                 # Fallback for missing cost basis: ITA default assumes ZERO
                 if cost_basis == 0 and qty > 0 and not is_fiat:
@@ -334,10 +344,11 @@ class TaxEngine:
 
 
         # 4. Handle Crypto Fee Disposals (CRITICAL ITA)
-        if tx.fee_amount > 0 and tx.fee_asset and tx.fee_asset not in ['USD', 'ILS']:
+        f_amt = tx.fee_amount or 0.0
+        if f_amt > 0 and tx.fee_asset and tx.fee_asset not in ['USD', 'ILS']:
             # This is a separate disposal of the fee asset
             fee_asset = tx.fee_asset
-            fee_qty = tx.fee_amount
+            fee_qty = f_amt
             fee_cost_basis = await ledger.consume_lots(fee_asset, fee_qty, tx)
             
             # Proceeds of fee disposal is its FMV
