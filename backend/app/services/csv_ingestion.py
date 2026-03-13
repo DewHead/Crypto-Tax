@@ -30,20 +30,37 @@ class CSVIngestionService:
 
     async def _process_binance_statements(self, lines: List[str], db: Optional[AsyncSession] = None):
         reader = csv.DictReader(lines)
-        groups = {}
-        for row in reader:
-            ts = row['UTC_Time']
-            if ts not in groups:
-                groups[ts] = []
-            groups[ts].append(row)
-        
+        # Group by timestamp (with 2s fuzzy window)
+        groups: List[List[dict]] = []
+        rows_sorted = sorted(list(reader), key=lambda x: x['UTC_Time'])
+
+        for row in rows_sorted:
+            ts_str = row['UTC_Time'].strip()
+            ts = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S')
+
+            added = False
+            if groups:
+                last_group = groups[-1]
+                last_ts_str = last_group[0]['UTC_Time'].strip()
+                last_ts = datetime.strptime(last_ts_str, '%Y-%m-%d %H:%M:%S')
+                if abs((ts - last_ts).total_seconds()) <= 2:
+                    last_group.append(row)
+                    added = True
+
+            if not added:
+                groups.append([row])
+
         income_ops = [
             'Distribution', 'Savings Interest', 'Simple Earn Flexible Interest', 'Simple Earn Locked Interest',
             'Commission History', 'Commission Rebate', 'Staking Rewards', 'Airdrop Assets'
         ]
-        
-        for ts, rows in groups.items():
-            timestamp = datetime.strptime(ts, '%Y-%m-%d %H:%M:%S')
+
+        for group_rows in groups:
+            ts_str = group_rows[0]['UTC_Time'].strip()
+            timestamp = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S')
+            ts = ts_str # for tx_hash
+            rows = group_rows
+
 
             # Identify components
             deposits = [r for r in rows if r['Operation'].strip() == 'Deposit']

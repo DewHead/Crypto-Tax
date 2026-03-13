@@ -33,6 +33,8 @@ class Transaction(TransactionBase):
     capital_gain_ils: Optional[float]
     ordinary_income_ils: Optional[float] = 0.0
     is_taxable_event: int
+    is_active: bool = True
+    parent_tx_id: Optional[int] = None
 
     class Config:
         from_attributes = True
@@ -47,4 +49,4 @@ class KPIReport(BaseModel):
     estimated_tax_ils: float
     trade_count: int
     total_transactions: int
-    is_business_threshold_crossed: bool
+    high_frequency_warning: bool

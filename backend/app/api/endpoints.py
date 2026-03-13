@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.db.session import get_db, AsyncSessionLocal
@@ -86,11 +86,15 @@ async def sync_one_key(key_id: int, background_tasks: BackgroundTasks):
 
 @router.get("/ledger", response_model=List[Transaction])
 async def get_ledger(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(TransactionModel).order_by(TransactionModel.timestamp.desc()))
+    result = await db.execute(
+        select(TransactionModel)
+        .filter(TransactionModel.is_active == True)
+        .order_by(TransactionModel.timestamp.desc())
+    )
     return result.scalars().all()
 
 @router.get("/kpi", response_model=KPIReport)
-async def get_kpi(year: Optional[int] = None, tax_bracket: float = 0.25, db: AsyncSession = Depends(get_db)):
+async def get_kpi(year: Optional[int] = None, tax_bracket: float = Query(0.25), db: AsyncSession = Depends(get_db)):
     return await tax_engine.get_kpi(db, year=year, tax_bracket=tax_bracket)
 
 @router.get("/years", response_model=List[int])

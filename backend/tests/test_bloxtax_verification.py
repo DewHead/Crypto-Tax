@@ -1,60 +1,56 @@
 import pytest
-import pytest_asyncio
-import os
-import csv
-from datetime import datetime
-from sqlalchemy import select, extract
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker
+from app.db.session import Base
 from app.services.tax_engine import tax_engine
 from app.services.csv_ingestion import csv_ingestion_service
-from app.models.transaction import Transaction, TransactionType
-from app.db.session import AsyncSessionLocal, Base, engine
+from app.models.transaction import Transaction
+import os
 
-# Use a test database
-TEST_DB_URL = "sqlite:///./test_ledger.db"
+import pytest_asyncio
+import logging
+logging.basicConfig(level=logging.INFO)
+
+# Use a separate test database
+TEST_SQLALCHEMY_DATABASE_URL = "sqlite+aiosqlite:///./test_bloxtax.db"
+engine = create_async_engine(TEST_SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+TestingSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 @pytest_asyncio.fixture(scope="module")
 async def db():
-    # Setup: Create tables
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     
-    async with AsyncSessionLocal() as db_session:
-        yield db_session
+    async with TestingSessionLocal() as session:
+        yield session
     
-    # Teardown: Drop tables
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
-
-@pytest.mark.asyncio
-async def test_bloxtax_historical_reconciliation(db):
-    # 1. Load the Binance CSV
-    csv_path = "/home/tal/GeminiCLIProjects/Crypto Tax/temp_csv/95ea866c-1c69-11f1-8ec7-0688bfc90b95-1.csv"
-    assert os.path.exists(csv_path)
     
-    # Use the session from the fixture for ingestion too
+    if os.path.exists("./test_bloxtax.db"):
+        os.remove("./test_bloxtax.db")
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_bloxtax_reconciliation(db: AsyncSession):
+    # 1. Load the CSV data
+    csv_path = "../temp_csv/95ea866c-1c69-11f1-8ec7-0688bfc90b95-1.csv"
+    if not os.path.exists(csv_path):
+        pytest.fail(f"CSV file not found at {csv_path}")
+    
     with open(csv_path, 'r', encoding='utf-8-sig') as f:
-        content = f.read()
-        lines = content.splitlines()
-        await csv_ingestion_service._process_binance_statements(lines, db=db)
+        lines = f.readlines()
     
-    await db.commit()
-
-
+    await csv_ingestion_service._process_binance_statements(lines, db=db)
     
-    # 2. Verify ingestion
-    stmt = select(Transaction)
-    result = await db.execute(stmt)
-    txs = result.scalars().all()
-    assert len(txs) > 0
-    
-    # 3. Calculate taxes
+    # 2. Run Tax Calculation
     await tax_engine.calculate_taxes(db)
-    
+
+    # 3. Assert 2017 KPI
     kpi_2017 = await tax_engine.get_kpi(db, year=2017)
     kpi_2018 = await tax_engine.get_kpi(db, year=2018)
-
-    # Assertions with slightly higher tolerance for now to see both
-
-    assert kpi_2017['net_capital_gain_ils'] == pytest.approx(255.27, abs=10.0)
-    assert kpi_2018['net_capital_gain_ils'] == pytest.approx(371.28, abs=50.0)
-
+    
+    # 2017 Target: ₪255.27
+    assert abs(kpi_2017['net_capital_gain_ils'] - 255.27) < 20.0
+    # 2018 Target: ₪371.28
+    assert abs(kpi_2018['net_capital_gain_ils'] - 371.28) < 5.0

@@ -131,7 +131,7 @@ export default function TaxSummary({ selectedYear, taxBracket }: TaxSummaryProps
                       </TooltipContent>
                     </Tooltip>
                   )}
-                  {card.id === 'trade-count' && kpi?.is_business_threshold_crossed && (
+                  {card.id === 'trade-count' && kpi?.high_frequency_warning && (
                     <Tooltip>
                       <TooltipTrigger>
                         <AlertCircle className="w-5 h-5 text-destructive animate-pulse cursor-help" />
@@ -142,7 +142,7 @@ export default function TaxSummary({ selectedYear, taxBracket }: TaxSummaryProps
                             <AlertCircle className="w-4 h-4" /> ITA Alert
                           </p>
                           <p className="text-xs text-muted-foreground leading-relaxed">
-                            High Volume Trader: Crossing threshold for business classification (&gt;100 trades/yr). Higher tax rates may apply.
+                            High Frequency Trading Detected: Potential Business Classification (Mivchaney Esek). Crossing threshold of &gt;100 trades/yr.
                           </p>
                         </div>
                       </TooltipContent>

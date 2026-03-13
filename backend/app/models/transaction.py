@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, Enum, Index, Date, Boolean
+from sqlalchemy import Column, Integer, String, Float, DateTime, Enum, Index, Date, Boolean, ForeignKey
 import enum
 from app.db.session import Base
 
@@ -39,6 +39,10 @@ class Transaction(Base):
     capital_gain_ils = Column(Float, nullable=True)
     ordinary_income_ils = Column(Float, nullable=True, default=0.0)
     is_taxable_event = Column(Integer, default=0) # 0 for false, 1 for true
+
+    # Pipeline flags
+    is_active = Column(Boolean, default=True)
+    parent_tx_id = Column(Integer, ForeignKey('transactions.id'), nullable=True)
 
     # Coinly Parity fields
     is_issue = Column(Boolean, default=False)
