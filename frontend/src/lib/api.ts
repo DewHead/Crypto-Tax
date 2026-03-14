@@ -56,4 +56,11 @@ export const syncKey = async (id: number): Promise<void> => {
   await api.post(`/sync/${id}`);
 };
 
+export const updateManualCostBasis = async (txId: number, manualCostBasisIls: number, manualPurchaseDate?: string): Promise<void> => {
+  await api.post(`/transactions/${txId}/manual-cost-basis`, {
+    manual_cost_basis_ils: manualCostBasisIls,
+    manual_purchase_date: manualPurchaseDate
+  });
+};
+
 export default api;

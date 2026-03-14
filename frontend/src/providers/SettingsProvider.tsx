@@ -5,30 +5,40 @@ import React, { createContext, useContext, useEffect, useState } from 'react';
 interface SettingsContextType {
   showOnlyBinanceCSV: boolean;
   setShowOnlyBinanceCSV: (value: boolean) => void;
+  language: 'en' | 'he';
+  setLanguage: (lang: 'en' | 'he') => void;
 }
 
 const SettingsContext = createContext<SettingsContextType | undefined>(undefined);
 
 export function SettingsProvider({ children }: { children: React.ReactNode }) {
   const [showOnlyBinanceCSV, setShowOnlyBinanceCSV] = useState<boolean>(false);
+  const [language, setLanguage] = useState<'en' | 'he'>('he');
   const [isLoaded, setIsLoaded] = useState(false);
 
   useEffect(() => {
-    const saved = localStorage.getItem('settings_showOnlyBinanceCSV');
-    if (saved !== null) {
-      setShowOnlyBinanceCSV(saved === 'true');
-    }
+    const savedCsv = localStorage.getItem('settings_showOnlyBinanceCSV');
+    if (savedCsv !== null) setShowOnlyBinanceCSV(savedCsv === 'true');
+    
+    const savedLang = localStorage.getItem('settings_language') as 'en' | 'he';
+    if (savedLang === 'en' || savedLang === 'he') setLanguage(savedLang);
+    
     setIsLoaded(true);
   }, []);
 
   useEffect(() => {
     if (isLoaded) {
       localStorage.setItem('settings_showOnlyBinanceCSV', showOnlyBinanceCSV.toString());
+      localStorage.setItem('settings_language', language);
+      
+      // Handle RTL
+      document.documentElement.dir = language === 'he' ? 'rtl' : 'ltr';
+      document.documentElement.lang = language;
     }
-  }, [showOnlyBinanceCSV, isLoaded]);
+  }, [showOnlyBinanceCSV, language, isLoaded]);
 
   return (
-    <SettingsContext.Provider value={{ showOnlyBinanceCSV, setShowOnlyBinanceCSV }}>
+    <SettingsContext.Provider value={{ showOnlyBinanceCSV, setShowOnlyBinanceCSV, language, setLanguage }}>
       {children}
     </SettingsContext.Provider>
   );

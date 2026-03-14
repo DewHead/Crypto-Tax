@@ -11,7 +11,7 @@ import {
 } from '@tanstack/react-table';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useRef, useMemo, useState } from 'react';
-import api, { ExchangeKey } from '@/lib/api';
+import api, { ExchangeKey, updateManualCostBasis } from '@/lib/api';
 import { cn, formatDate } from '@/lib/utils';
 import { 
   RefreshCw, 
@@ -22,7 +22,9 @@ import {
   Link as LinkIcon,
   ArrowUpDown,
   ChevronUp,
-  ChevronDown
+  ChevronDown,
+  X,
+  CheckCircle2
 } from 'lucide-react';
 import {
   Table,
@@ -61,11 +63,13 @@ interface Transaction {
   issue_notes?: string;
   category?: string;
   linked_transaction_id?: number;
+  manual_cost_basis_ils?: number;
+  manual_purchase_date?: string;
 }
 
 const columnHelper = createColumnHelper<Transaction>();
 
-const columns = [
+const createColumns = (onResolve: (tx: Transaction) => void) => [
   columnHelper.accessor('timestamp', {
     header: 'Date',
     cell: (info) => (
@@ -115,17 +119,27 @@ const columns = [
             )}
           </div>
           {isIssue && (
-            <TooltipProvider>
-              <Tooltip>
-                <TooltipTrigger>
-                  <AlertCircle className="w-4 h-4 text-destructive" />
-                </TooltipTrigger>
-                <TooltipContent className="max-w-xs p-3">
-                  <p className="font-bold text-destructive mb-1">Data Issue</p>
-                  <p className="text-xs">{info.row.original.issue_notes}</p>
-                </TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
+            <div className="flex items-center gap-1.5">
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger>
+                    <AlertCircle className="w-4 h-4 text-destructive" />
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-xs p-3">
+                    <p className="font-bold text-destructive mb-1">Data Issue</p>
+                    <p className="text-xs">{info.row.original.issue_notes}</p>
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+              <Button 
+                variant="ghost" 
+                size="sm" 
+                className="h-6 px-2 text-[10px] font-black bg-destructive/10 text-destructive hover:bg-destructive hover:text-white rounded-full transition-all"
+                onClick={() => onResolve(info.row.original)}
+              >
+                RESOLVE
+              </Button>
+            </div>
           )}
         </div>
       );
@@ -175,6 +189,102 @@ const columns = [
   }),
 ];
 
+interface ResolveModalProps {
+  tx: Transaction;
+  onClose: () => void;
+  onSubmit: (costBasis: number, date?: string) => void;
+  isSubmitting: boolean;
+}
+
+function ResolveModal({ tx, onClose, onSubmit, isSubmitting }: ResolveModalProps) {
+  const [costBasis, setCostBasis] = useState<string>('');
+  const [date, setDate] = useState<string>('');
+
+  return (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
+      <motion.div 
+        initial={{ scale: 0.95, opacity: 0 }}
+        animate={{ scale: 1, opacity: 1 }}
+        className="bg-card border shadow-2xl rounded-2xl w-full max-w-md overflow-hidden"
+      >
+        <div className="p-6 border-b flex justify-between items-center bg-muted/20">
+          <div>
+            <h3 className="text-xl font-bold">Resolve Transaction</h3>
+            <p className="text-sm text-muted-foreground mt-1">Manual Cost Basis Override</p>
+          </div>
+          <Button variant="ghost" size="icon" onClick={onClose} className="rounded-full">
+            <X className="w-5 h-5" />
+          </Button>
+        </div>
+        
+        <div className="p-6 space-y-6">
+          <div className="bg-amber-500/5 border border-amber-500/10 rounded-xl p-4 flex gap-3">
+            <AlertCircle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
+            <div className="text-sm">
+              <p className="font-bold text-amber-700">Missing purchase history</p>
+              <p className="text-amber-800/70">
+                You are selling {tx.amount_from} {tx.asset_from} on {formatDate(tx.timestamp)}. 
+                Enter the original cost to avoid zero cost basis.
+              </p>
+            </div>
+          </div>
+
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <label className="text-sm font-bold ml-1">Original Cost Basis (Total ILS)</label>
+              <div className="relative">
+                <div className="absolute left-4 top-1/2 -translate-y-1/2 text-muted-foreground font-bold">₪</div>
+                <input 
+                  type="number"
+                  step="0.01"
+                  value={costBasis}
+                  onChange={(e) => setCostBasis(e.target.value)}
+                  placeholder="0.00"
+                  className="w-full bg-muted/30 border-muted/50 rounded-xl py-3 pl-10 pr-4 focus:ring-2 focus:ring-primary/20 focus:border-primary outline-none transition-all font-mono"
+                  autoFocus
+                />
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-sm font-bold ml-1">Original Purchase Date (Optional)</label>
+              <input 
+                type="date"
+                value={date}
+                onChange={(e) => setDate(e.target.value)}
+                className="w-full bg-muted/30 border-muted/50 rounded-xl py-3 px-4 focus:ring-2 focus:ring-primary/20 focus:border-primary outline-none transition-all"
+              />
+              <p className="text-[10px] text-muted-foreground ml-1 uppercase font-bold tracking-wider">
+                Used for CPI (Madad) inflationary adjustment
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div className="p-6 bg-muted/20 border-t flex gap-3">
+          <Button variant="outline" onClick={onClose} className="flex-1 rounded-xl h-12 font-bold">
+            Cancel
+          </Button>
+          <Button 
+            onClick={() => onSubmit(parseFloat(costBasis), date || undefined)} 
+            disabled={!costBasis || isSubmitting}
+            className="flex-1 rounded-xl h-12 font-bold shadow-lg shadow-primary/20"
+          >
+            {isSubmitting ? (
+              <RefreshCw className="w-5 h-5 animate-spin" />
+            ) : (
+              <>
+                <CheckCircle2 className="w-5 h-5 mr-2" />
+                Apply Override
+              </>
+            )}
+          </Button>
+        </div>
+      </motion.div>
+    </div>
+  );
+}
+
 interface TransactionsTableProps {
   selectedYear: number | null;
 }
@@ -182,6 +292,8 @@ interface TransactionsTableProps {
 export default function TransactionsTable({ selectedYear }: TransactionsTableProps) {
   const queryClient = useQueryClient();
   const { showOnlyBinanceCSV } = useSettings();
+  
+  const [resolvingTx, setResolvingTx] = useState<Transaction | null>(null);
 
   const { data: transactions = [], isLoading } = useQuery<Transaction[]>({
     queryKey: ['ledger'],
@@ -190,6 +302,22 @@ export default function TransactionsTable({ selectedYear }: TransactionsTablePro
       return data;
     },
   });
+
+  const resolveMutation = useMutation({
+    mutationFn: ({ txId, costBasis, date }: { txId: number, costBasis: number, date?: string }) => 
+      updateManualCostBasis(txId, costBasis, date),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['ledger'] });
+      queryClient.invalidateQueries({ queryKey: ['kpi'] });
+      toast.success('Cost basis updated. Recalculating taxes...');
+      setResolvingTx(null);
+    },
+    onError: (error) => {
+      toast.error(`Failed to update: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  });
+
+  const columns = useMemo(() => createColumns(setResolvingTx), []);
 
   const filteredTransactions = useMemo(() => {
     let filtered = transactions;
@@ -413,6 +541,21 @@ export default function TransactionsTable({ selectedYear }: TransactionsTablePro
           </TableBody>
         </Table>
       </div>
+
+      {resolvingTx && (
+        <ResolveModal 
+          tx={resolvingTx} 
+          onClose={() => setResolvingTx(null)}
+          isSubmitting={resolveMutation.isPending}
+          onSubmit={(costBasis, date) => {
+            resolveMutation.mutate({ 
+              txId: resolvingTx.id, 
+              costBasis, 
+              date 
+            });
+          }}
+        />
+      )}
     </motion.div>
   );
 }

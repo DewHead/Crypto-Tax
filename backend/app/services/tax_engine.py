@@ -1,6 +1,7 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, extract, distinct, delete
 from app.models.transaction import Transaction, TransactionType
+from app.models.exchange_key import ExchangeKey as ExchangeKeyModel
 from app.models.tax_lot_consumption import TaxLotConsumption
 from app.services.boi import boi_service
 from app.services.cpi import cpi_service
@@ -27,6 +28,46 @@ class TaxLedger:
 
     async def consume_lots(self, asset: str, qty: float, sell_tx: Transaction) -> tuple[float, List[TaxLotConsumption]]:
         logger.info(f"Consuming {qty} {asset} for TX {sell_tx.id} ({sell_tx.timestamp})")
+        
+        # 1. Handle Manual Cost Basis Override
+        if sell_tx.manual_cost_basis_ils is not None:
+            # We MUST still consume from inventory to keep balances correct
+            qty_to_match = qty
+            while qty_to_match > 1e-10 and asset in self.inventory and self.inventory[asset]:
+                oldest_buy = self.inventory[asset][0]
+                if oldest_buy['amount'] <= qty_to_match:
+                    qty_to_match -= oldest_buy['amount']
+                    self.inventory[asset].pop(0)
+                else:
+                    oldest_buy['amount'] -= qty_to_match
+                    oldest_buy['cost_basis_ils'] -= (oldest_buy['cost_basis_ils'] / (oldest_buy['amount'] + qty_to_match)) * qty_to_match
+                    qty_to_match = 0
+            
+            # CPI Adjustment for manual entry
+            cpi_sell = await cpi_service.get_cpi_index(get_jerusalem_date(sell_tx.timestamp), self.db)
+            original_cost = sell_tx.manual_cost_basis_ils
+            adjusted_cost = original_cost
+            
+            if sell_tx.manual_purchase_date:
+                cpi_buy = await cpi_service.get_cpi_index(sell_tx.manual_purchase_date, self.db)
+                cpi_ratio = max(1.0, cpi_sell / cpi_buy)
+                adjusted_cost = original_cost * cpi_ratio
+            
+            # Record a manual consumption record for the audit trail
+            consumption = TaxLotConsumption(
+                sell_tx_id=sell_tx.id,
+                buy_tx_id=None, # Manual override has no linked buy TX
+                amount_consumed=qty,
+                ils_value_consumed=original_cost,
+                adjusted_cost_basis_ils=adjusted_cost
+            )
+            self.db.add(consumption)
+            
+            # Reset issue status if it was previously flagged
+            sell_tx.is_issue = False
+            
+            return original_cost, [consumption]
+
         if asset not in self.inventory or not self.inventory[asset]:
             # Missing cost basis - ITA rule: Default to ZERO
             sell_tx.is_issue = True
@@ -488,10 +529,62 @@ class TaxEngine:
             tx.is_taxable_event = 1
 
     async def get_kpi(self, db: AsyncSession, year: Optional[int] = None, tax_bracket: float = 0.25) -> Dict[str, Any]:
-        stmt = select(Transaction).order_by(Transaction.timestamp.asc())
+        # Clear session to force fresh data from DB
+        db.expire_all()
+        
+        # We fetch only essential fields to avoid object attachment issues if possible, 
+        # but let's stick to the model for now and ensure we have fresh data.
+        stmt = select(Transaction).where(Transaction.is_active == True).order_by(Transaction.timestamp.asc())
         result = await db.execute(stmt)
         all_txs = result.scalars().all()
         
+        # 1. Form 1391 Check (Foreign Assets > 2M ILS)
+        foreign_exchanges = set()
+        keys_stmt = select(ExchangeKeyModel)
+        keys_result = await db.execute(keys_stmt)
+        for k in keys_result.scalars().all():
+            if k.exchange_name.lower() not in ['bitsofgold', 'altshuler']:
+                foreign_exchanges.add(k.exchange_name.lower())
+        
+        max_daily_foreign_value_ils = 0.0
+        form_1391_breached = False
+        threshold_ils = 2000000.0
+        
+        inventory_by_exchange: Dict[str, Dict[str, float]] = {}
+        txs_by_date: Dict[date, List[Transaction]] = {}
+        for tx in all_txs:
+            d = get_jerusalem_date(tx.timestamp)
+            txs_by_date.setdefault(d, []).append(tx)
+            
+        for d in sorted(txs_by_date.keys()):
+            for tx in txs_by_date[d]:
+                ex = tx.exchange.lower()
+                if ex not in inventory_by_exchange: inventory_by_exchange[ex] = {}
+                if tx.asset_from: inventory_by_exchange[ex][tx.asset_from] = inventory_by_exchange[ex].get(tx.asset_from, 0.0) - (tx.amount_from or 0.0)
+                if tx.asset_to: inventory_by_exchange[ex][tx.asset_to] = inventory_by_exchange[ex].get(tx.asset_to, 0.0) + (tx.amount_to or 0.0)
+                if tx.fee_asset: inventory_by_exchange[ex][tx.fee_asset] = inventory_by_exchange[ex].get(tx.fee_asset, 0.0) - (tx.fee_amount or 0.0)
+            
+            if year and d.year < year: continue
+            if year and d.year > year: break
+            
+            daily_foreign_val = 0.0
+            if any(ex in foreign_exchanges for ex in inventory_by_exchange):
+                usd_ils_rate = await boi_service.get_usd_ils_rate(d, db=db)
+                for ex in foreign_exchanges:
+                    if ex in inventory_by_exchange:
+                        for asset, qty in inventory_by_exchange[ex].items():
+                            if qty > 1e-8:
+                                if asset not in ['USD', 'ILS']:
+                                    usd_price = await price_service.get_historical_price(asset, d)
+                                    if usd_price: daily_foreign_val += qty * usd_price * usd_ils_rate
+                                elif asset == 'USD':
+                                    daily_foreign_val += qty * usd_ils_rate
+                
+                if daily_foreign_val > max_daily_foreign_value_ils:
+                    max_daily_foreign_value_ils = daily_foreign_val
+                    if max_daily_foreign_value_ils > threshold_ils: form_1391_breached = True
+
+        # 2. Tax KPIs
         accumulated_loss = 0.0
         report_year_real_gain = 0.0
         report_year_ordinary = 0.0
@@ -503,33 +596,27 @@ class TaxEngine:
         
         txs_by_year: Dict[int, List[Transaction]] = {}
         for tx in all_txs:
-            if not tx.is_active: continue
-            # ITA Rule: Fiscal year must follow Jerusalem Time.
             y = get_jerusalem_date(tx.timestamp).year
-            if y not in txs_by_year: txs_by_year[y] = []
-            txs_by_year[y].append(tx)
+            txs_by_year.setdefault(y, []).append(tx)
         
         for y in sorted(txs_by_year.keys()):
-            # ITA Rule: Tax is on Real Gain. 
-            # If Real Gain < 0, it's a loss that can offset other capital gains.
-            y_nominal_gain = sum(t.capital_gain_ils or 0.0 for t in txs_by_year[y] if t.is_taxable_event)
-            y_real_gain = sum(t.real_gain_ils or 0.0 for t in txs_by_year[y] if t.is_taxable_event)
-            y_inflationary_gain = sum(t.inflationary_gain_ils or 0.0 for t in txs_by_year[y] if t.is_taxable_event)
-            y_ordinary = sum(t.ordinary_income_ils or 0.0 for t in txs_by_year[y])
-            
-            # ITA Form 1391: Sum of only negative real gains this year
-            y_capital_losses = sum(abs(t.real_gain_ils) for t in txs_by_year[y] if t.is_taxable_event and t.real_gain_ils < 0)
+            y_txs = txs_by_year[y]
+            y_real_gain = sum(t.real_gain_ils or 0.0 for t in y_txs if t.is_taxable_event == 1)
+            y_nominal_gain = sum(t.capital_gain_ils or 0.0 for t in y_txs if t.is_taxable_event == 1)
+            y_inflationary_gain = sum(t.inflationary_gain_ils or 0.0 for t in y_txs if t.is_taxable_event == 1)
+            y_ordinary = sum(t.ordinary_income_ils or 0.0 for t in y_txs)
+            y_capital_losses = sum(abs(t.real_gain_ils) for t in y_txs if t.is_taxable_event == 1 and (t.real_gain_ils or 0) < 0)
 
             if year and y < year:
                 accumulated_loss += y_real_gain
                 if accumulated_loss > 0: accumulated_loss = 0.0 
             elif year is None or y == year:
-                report_year_trade_count += len([t for t in txs_by_year[y] if t.is_taxable_event and t.capital_gain_ils != 0])
+                report_year_trade_count += len([t for t in y_txs if t.is_taxable_event == 1 and ((t.capital_gain_ils or 0) != 0 or (t.real_gain_ils or 0) != 0)])
                 report_year_total_nominal_gain += y_nominal_gain
                 report_year_inflationary_gain += y_inflationary_gain
                 report_year_capital_losses += y_capital_losses
                 report_year_ordinary += y_ordinary
-                report_year_issue_count += len([t for t in txs_by_year[y] if t.is_issue])
+                report_year_issue_count += len([t for t in y_txs if t.is_issue])
                 
                 net_real_gain = y_real_gain + accumulated_loss
                 if net_real_gain < 0:
@@ -539,7 +626,7 @@ class TaxEngine:
                     report_year_real_gain = net_real_gain
                     accumulated_loss = 0.0
         
-        all_tx_count = len([t for t in all_txs if (year is None or get_jerusalem_date(t.timestamp).year == year) and t.is_active])
+        all_tx_count = len([t for t in all_txs if (year is None or get_jerusalem_date(t.timestamp).year == year)])
         
         return {
             'year': year,
@@ -554,23 +641,89 @@ class TaxEngine:
             'trade_count': report_year_trade_count,
             'total_transactions': all_tx_count,
             'high_frequency_warning': report_year_trade_count > 100,
-            'issue_count': report_year_issue_count
+            'issue_count': report_year_issue_count,
+            'form_1391_breached': form_1391_breached,
+            'max_foreign_value_ils': round(max_daily_foreign_value_ils, 2)
         }
 
-    async def get_years(self, db: AsyncSession) -> List[int]:
-        # We fetch distinct years from UTC first as a rough set
-        stmt = select(distinct(extract('year', Transaction.timestamp)))
-        result = await db.execute(stmt)
-        base_years = [int(row[0]) for row in result.all() if row[0] is not None]
+    async def get_unrealized_inventory(self, db: AsyncSession) -> List[Dict[str, Any]]:
+        # 1. Fetch all active transactions to build current ledger state
+        txs_stmt = select(Transaction).order_by(Transaction.timestamp.asc())
+        result = await db.execute(txs_stmt)
+        all_txs = result.scalars().all()
         
-        # Then we specifically check for edge cases near Jan 1st
-        # In reality, grouping by get_jerusalem_date(timestamp).year is the only 100% correct way.
-        # Since the number of transactions is manageable, we'll fetch all active timestamps.
+        if not all_txs:
+            return []
+
+        # We don't merge or reconcile here to avoid modifying DB, just build the FIFO state
+        active_txs = [t for t in all_txs if t.is_active]
+        
+        # Phase 3: The FIFO Ledger (Read-only simulation)
+        ledger = TaxLedger(db)
+        for tx in active_txs:
+            amt_from = tx.amount_from or 0.0
+            amt_to = tx.amount_to or 0.0
+            
+            # Acquisition
+            if amt_to > 0 and tx.asset_to and tx.asset_to not in ['USD', 'ILS']:
+                cost = tx.cost_basis_ils or 0.0
+                await ledger.add_lot(tx.asset_to, amt_to, cost, tx)
+            
+            # Disposal
+            if amt_from > 0 and tx.asset_from and tx.asset_from not in ['USD', 'ILS']:
+                await ledger.consume_lots(tx.asset_from, amt_from, tx)
+
+        # 2. Calculate unrealized PnL using current prices
+        unrealized = []
+        usd_ils_rate = await boi_service.get_usd_ils_rate(date.today() - timedelta(days=1), db=db)
+        
+        for asset, lots in ledger.inventory.items():
+            total_qty = sum(l['amount'] for l in lots)
+            if total_qty < 1e-8: continue
+            
+            total_cost_basis = sum(l['cost_basis_ils'] for l in lots)
+            
+            cpi_current = await cpi_service.get_cpi_index(date.today(), db)
+            total_adjusted_cost_basis = 0.0
+            for l in lots:
+                cpi_buy = await cpi_service.get_cpi_index(get_jerusalem_date(l['timestamp']), db)
+                total_adjusted_cost_basis += l['cost_basis_ils'] * max(1.0, cpi_current / cpi_buy)
+            
+            current_price_usd = await price_service.get_current_price(asset)
+            if current_price_usd:
+                current_value_ils = total_qty * current_price_usd * usd_ils_rate
+                unrealized_gain_ils = current_value_ils - total_cost_basis
+                real_unrealized_gain_ils = current_value_ils - total_adjusted_cost_basis
+                
+                unrealized.append({
+                    'asset': asset,
+                    'quantity': round(total_qty, 8),
+                    'cost_basis_ils': round(total_cost_basis, 2),
+                    'current_price_usd': round(current_price_usd, 4),
+                    'current_value_ils': round(current_value_ils, 2),
+                    'unrealized_gain_ils': round(unrealized_gain_ils, 2),
+                    'real_unrealized_gain_ils': round(real_unrealized_gain_ils, 2),
+                    'potential_tax_saving_ils': round(abs(min(0, real_unrealized_gain_ils)) * 0.25, 2)
+                })
+            else:
+                unrealized.append({
+                    'asset': asset,
+                    'quantity': round(total_qty, 8),
+                    'cost_basis_ils': round(total_cost_basis, 2),
+                    'current_price_usd': None,
+                    'current_value_ils': 0.0,
+                    'unrealized_gain_ils': 0.0,
+                    'real_unrealized_gain_ils': 0.0,
+                    'potential_tax_saving_ils': 0.0
+                })
+        
+        return sorted(unrealized, key=lambda x: x['real_unrealized_gain_ils'])
+
+    async def get_years(self, db: AsyncSession) -> List[int]:
         stmt = select(Transaction.timestamp).where(Transaction.is_active == True)
         result = await db.execute(stmt)
         years = set()
         for row in result.all():
             if row[0]:
                 years.add(get_jerusalem_date(row[0]).year)
-        
-        return sorted(list(years), reverse=True) if years else sorted(base_years, reverse=True)
+        return sorted(list(years), reverse=True) if years else [date.today().year]

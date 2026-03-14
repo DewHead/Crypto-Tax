@@ -110,6 +110,11 @@ class PriceService:
                             return price
         return None
 
+    async def get_current_price(self, asset: str) -> Optional[float]:
+        """Fetch the most recent price for an asset."""
+        # Using yesterday's price as a proxy for 'current' to ensure we have a closed candle
+        return await self.get_historical_price(asset, date.today() - timedelta(days=1))
+
     async def close(self):
         if self._binance: await self._binance.close(); self._binance = None
         if self._kraken: await self._kraken.close(); self._kraken = None

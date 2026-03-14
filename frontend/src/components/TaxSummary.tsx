@@ -1,25 +1,18 @@
-"use client";
+'use client';
 
 import { useQuery } from '@tanstack/react-query';
 import api from '@/lib/api';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { motion, AnimatePresence } from 'framer-motion';
-import { 
-  TrendingUp, 
-  Wallet, 
-  Receipt, 
-  ShieldCheck, 
-  AlertCircle,
-  Clock,
-  ArrowUpRight
-} from 'lucide-react';
+import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
+import { AlertCircle, TrendingUp, Hash, ReceiptText, Info, Library } from 'lucide-react';
 import { Skeleton } from '@/components/ui/skeleton';
+import { Badge } from '@/components/ui/badge';
 import {
   Tooltip,
   TooltipContent,
-  TooltipProvider,
   TooltipTrigger,
-} from "@/components/ui/tooltip";
+} from '@/components/ui/tooltip';
+import { motion, AnimatePresence } from 'framer-motion';
+import { useTranslation } from '@/lib/translations';
 
 interface TaxSummaryProps {
   selectedYear: number | null;
@@ -27,15 +20,29 @@ interface TaxSummaryProps {
 }
 
 export default function TaxSummary({ selectedYear, taxBracket }: TaxSummaryProps) {
-  const { data: kpi, isLoading } = useQuery({
+  const { t } = useTranslation();
+  const { data: kpi, isLoading: isLoadingKpi } = useQuery({
     queryKey: ['kpi', selectedYear, taxBracket],
     queryFn: async () => {
       const { data } = await api.get('/kpi', {
-        params: { year: selectedYear, tax_bracket: taxBracket }
+        params: { 
+          year: selectedYear,
+          tax_bracket: taxBracket
+        }
       });
       return data;
     },
   });
+
+  const { data: unrealized = [], isLoading: isLoadingUnrealized } = useQuery({
+    queryKey: ['unrealized-inventory'],
+    queryFn: async () => {
+      const { data } = await api.get('/unrealized-inventory');
+      return data;
+    },
+  });
+
+  const isLoading = isLoadingKpi || isLoadingUnrealized;
 
   if (isLoading) {
     return (
@@ -47,8 +54,8 @@ export default function TaxSummary({ selectedYear, taxBracket }: TaxSummaryProps
               <Skeleton className="h-4 w-4 rounded-full" />
             </CardHeader>
             <CardContent>
-              <Skeleton className="h-8 w-32 mb-2" />
-              <Skeleton className="h-3 w-40" />
+              <Skeleton className="h-10 w-32 mb-2" />
+              <Skeleton className="h-3 w-48" />
             </CardContent>
           </Card>
         ))}
@@ -58,7 +65,17 @@ export default function TaxSummary({ selectedYear, taxBracket }: TaxSummaryProps
 
   const cards = [
     {
-      title: 'Net Realized Gain',
+      title: 'Estimated Liability',
+      value: `₪${kpi?.estimated_tax_ils?.toLocaleString() || '0'}`,
+      subtitle: `Applied ${Math.round(taxBracket * 100)}% Tax Rate`,
+      icon: ReceiptText,
+      tooltip: 'Calculated by applying the selected tax bracket to your net gains and ordinary income.',
+      color: 'text-destructive',
+      glow: 'shadow-[0_0_20px_-5px_oklch(0.577_0.245_27.325_/_0.2)]',
+      id: 'estimated-liability'
+    },
+    {
+      title: 'Net Capital Gain',
       value: `₪${kpi?.net_capital_gain_ils?.toLocaleString() || '0'}`,
       subtitle: kpi?.carried_forward_loss_ils > 0 
         ? `₪${kpi?.carried_forward_loss_ils?.toLocaleString()} Loss Applied`
@@ -66,7 +83,7 @@ export default function TaxSummary({ selectedYear, taxBracket }: TaxSummaryProps
       icon: TrendingUp,
       color: kpi?.net_capital_gain_ils >= 0 ? 'text-green-500' : 'text-destructive',
       glow: kpi?.net_capital_gain_ils >= 0 
-        ? 'shadow-[0_0_20px_-5px_oklch(0.723_0.219_149.579_/_0.2)]' 
+        ? 'shadow-[0_0_20px_-5px_oklch(0.7_0.2_140_/_0.2)]'
         : 'shadow-[0_0_20px_-5px_oklch(0.577_0.245_27.325_/_0.2)]',
       id: 'total-gain'
     },
@@ -102,29 +119,34 @@ export default function TaxSummary({ selectedYear, taxBracket }: TaxSummaryProps
       id: 'ordinary-income'
     },
     {
-      title: 'Est. Tax Liability',
-      value: `₪${kpi?.estimated_tax_ils?.toLocaleString() || '0'}`,
-      subtitle: 'Before Local Offsets',
-      icon: ShieldCheck,
-      color: 'text-primary',
-      glow: 'shadow-[0_0_20px_-5px_oklch(0.707_0.022_261.625_/_0.2)]',
-      id: 'estimated-liability'
+      title: 'Potential Savings',
+      value: `₪${unrealized.reduce((acc: number, item: any) => acc + (item.potential_tax_saving_ils || 0), 0).toLocaleString()}`,
+      subtitle: 'Tax-Loss Harvesting',
+      icon: TrendingUp,
+      tooltip: 'Selling current loss-making assets before Dec 31st can reduce your tax bill by this amount.',
+      color: 'text-green-500',
+      glow: 'shadow-[0_0_20px_-5px_oklch(0.7_0.2_140_/_0.2)]',
+      id: 'tax-loss-savings'
     },
     {
-      title: 'Trading Activity',
-      value: kpi?.trade_count?.toLocaleString() || '0',
-      subtitle: 'Taxable Disposals',
-      icon: Receipt,
-      color: 'text-muted-foreground',
+      title: 'Trade Frequency',
+      value: kpi?.trade_count,
+      subtitle: 'Taxable events identified',
+      icon: Hash,
+      tooltip: 'Total number of taxable events in the current period.',
+      color: 'text-foreground',
+      glow: 'shadow-[0_0_20px_-5px_oklch(0.205_0_0_/_0.1)]',
       id: 'trade-count'
     },
     {
-      title: 'Audit Health',
-      value: kpi?.high_frequency_warning ? 'High Vol' : 'Healthy',
-      subtitle: kpi?.high_frequency_warning ? 'Over 100 Trades' : 'Standard Trader',
-      icon: kpi?.high_frequency_warning ? AlertCircle : ShieldCheck,
-      color: kpi?.high_frequency_warning ? 'text-amber-500' : 'text-green-500',
-      id: 'ita-alert'
+      title: 'Total Ledger',
+      value: kpi?.total_transactions,
+      subtitle: 'All indexed records',
+      icon: Library,
+      tooltip: 'Complete number of transactions imported from all sources.',
+      color: 'text-muted-foreground',
+      glow: 'shadow-[0_0_20px_-5px_oklch(0.205_0_0_/_0.05)]',
+      id: 'total-transactions'
     }
   ];
 
@@ -136,33 +158,49 @@ export default function TaxSummary({ selectedYear, taxBracket }: TaxSummaryProps
             key={card.title}
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: idx * 0.1 }}
-            layout
+            transition={{ delay: idx * 0.1, type: 'spring', stiffness: 260, damping: 20 }}
           >
-            <Card className={`group bg-card/40 backdrop-blur-xl border-muted/40 hover:border-primary/30 transition-all duration-500 hover:scale-[1.02] active:scale-[0.98] ${card.glow || ''}`}>
-              <CardHeader className="flex flex-row items-center justify-between pb-3 space-y-0">
-                <CardTitle className="text-xs font-bold uppercase tracking-widest text-muted-foreground/70 group-hover:text-primary/70 transition-colors">
-                  {card.title}
-                </CardTitle>
-                <div className={`p-2 rounded-lg bg-background/50 border border-muted/20 group-hover:border-primary/20 transition-colors`}>
-                  <card.icon className={`h-4 w-4 ${card.color}`} />
-                </div>
-              </CardHeader>
-              <CardContent>
-                <div className="flex items-baseline gap-2">
-                  <div className={`text-3xl font-bold tracking-tight ${card.color}`} data-testid={card.id}>
-                    {card.value}
-                  </div>
-                  {idx < 2 && (
-                    <div className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-green-500/10 text-green-500 flex items-center gap-0.5">
-                      <ArrowUpRight className="w-2.5 h-2.5" />
-                      12%
-                    </div>
+            <Card className={`group relative overflow-hidden transition-all duration-300 hover:scale-[1.02] bg-card/50 backdrop-blur-xl border-muted/50 ${card.glow}`}>
+              <CardHeader className="flex flex-row items-center justify-between pb-2 space-y-0">
+                <div className="flex items-center gap-2">
+                  <CardTitle className="text-xl font-medium text-muted-foreground">{card.title}</CardTitle>
+                  {card.tooltip && (
+                    <Tooltip>
+                      <TooltipTrigger>
+                        <Info className="w-4 h-4 text-muted-foreground/50 hover:text-muted-foreground cursor-help transition-colors" />
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p className="text-sm">{card.tooltip}</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  )}
+                  {card.id === 'trade-count' && kpi?.high_frequency_warning && (
+                    <Tooltip>
+                      <TooltipTrigger>
+                        <AlertCircle className="w-5 h-5 text-destructive animate-pulse cursor-help" />
+                      </TooltipTrigger>
+                      <TooltipContent side="top" className="max-w-[250px] bg-background border-destructive/30">
+                        <div className="flex flex-col gap-1">
+                          <p className="text-sm font-bold text-destructive flex items-center gap-1">
+                            <AlertCircle className="w-4 h-4" /> ITA Alert
+                          </p>
+                          <p className="text-xs text-muted-foreground leading-relaxed">
+                            High Frequency Trading Detected: Potential Business Classification (Mivchaney Esek). Crossing threshold of &gt;100 trades/yr.
+                          </p>
+                        </div>
+                      </TooltipContent>
+                    </Tooltip>
                   )}
                 </div>
-                <div className="flex items-center gap-2 mt-2">
-                  <span className="text-xs font-medium text-muted-foreground/60">{card.subtitle}</span>
+                <card.icon className="w-5 h-5 text-muted-foreground/70 group-hover:text-foreground transition-colors" />
+              </CardHeader>
+              <CardContent>
+                <div data-testid={card.id} className={`text-4xl font-bold font-mono tracking-tight ${card.color}`}>
+                  {card.value}
                 </div>
+                {card.subtitle && (
+                  <p className="text-sm text-muted-foreground/80 mt-2 font-medium">{card.subtitle}</p>
+                )}
               </CardContent>
             </Card>
           </motion.div>
