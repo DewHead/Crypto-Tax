@@ -60,7 +60,7 @@ class KPIReport(BaseModel):
     year: Optional[int] = None
     total_nominal_gain_ils: float
     ordinary_income_ils: float
-    net_real_capital_gain_ils: float
+    net_capital_gain_ils: float
     carried_forward_loss_ils: float
     tax_bracket: float
     estimated_tax_ils: float

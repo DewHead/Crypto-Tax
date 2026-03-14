@@ -215,57 +215,52 @@ class TaxEngine:
     async def _run_transfer_reconciliation(self, txs: List[Transaction], db: AsyncSession) -> Set[int]:
         withdrawals = [t for t in txs if t.is_active and t.type == TransactionType.withdrawal]
         deposits = [t for t in txs if t.is_active and t.type == TransactionType.deposit]
-        
-        # Optimization: Group withdrawals by asset
-        w_by_asset: Dict[str, List[Transaction]] = {}
-        for w in withdrawals:
-            if w.asset_from not in w_by_asset:
-                w_by_asset[w.asset_from] = []
-            w_by_asset[w.asset_from].append(w)
-            
         reconciled_ids: Set[int] = set()
-        
-        for d in deposits:
-            asset = d.asset_to
-            if asset not in w_by_asset:
-                continue
-                
-            d_amt = d.amount_to or 0.0
-            for w in w_by_asset[asset]:
-                if w.id in reconciled_ids:
-                    continue
-                
-                time_diff = (d.timestamp - w.timestamp).total_seconds()
-                # Transfers usually take some time, but we allow up to 24h
-                if 0 <= time_diff <= 86400:
-                    w_amt = w.amount_from or 0.0
-                    # Heuristic: 5% fee variance
-                    if d_amt <= w_amt and d_amt >= (w_amt * 0.95):
-                        w.is_taxable_event = 0
-                        d.is_taxable_event = 0
-                        w.linked_transaction_id = d.id
-                        d.linked_transaction_id = w.id
-                        w.category = "Transfer"
-                        d.category = "Transfer"
-                        
-                        reconciled_ids.add(w.id)
-                        reconciled_ids.add(d.id)
-                        
-                        fee_amount = w_amt - d_amt
-                        if fee_amount > 1e-10:
-                            w.fee_amount = (w.fee_amount or 0.0) + fee_amount
-                            w.fee_asset = w.asset_from
-                            w.issue_notes = (w.issue_notes or "") + f" | Transfer fee applied: {fee_amount} {w.asset_from}"
-                        break
-                elif time_diff > 86400:
-                    # Since withdrawals are sorted by time, we can stop if we're too far in the future
-                    # Actually deposits are sorted too. 
-                    # If this deposit is already > 24h after this withdrawal, 
-                    # we should probably skip this withdrawal for FUTURE deposits too?
-                    # No, this loop is over d, so we can't easily skip for future d's without more complex logic.
-                    pass
-        return reconciled_ids
 
+        w_by_asset = {}
+        for w in withdrawals: w_by_asset.setdefault(w.asset_from, []).append(w)
+        d_by_asset = {}
+        for d in deposits: d_by_asset.setdefault(d.asset_to, []).append(d)
+
+        for asset, asset_withdrawals in w_by_asset.items():
+            asset_deposits = d_by_asset.get(asset, [])
+            d_idx = 0
+            d_len = len(asset_deposits)
+
+            for w in asset_withdrawals:
+                w_amt = w.amount_from or 0.0
+
+                # Fast-forward deposit pointer to ignore old deposits
+                while d_idx < d_len and (asset_deposits[d_idx].timestamp - w.timestamp).total_seconds() < 0:
+                    d_idx += 1
+
+                # Scan deposits inside the 24h window
+                curr_d_idx = d_idx
+                while curr_d_idx < d_len:
+                    d = asset_deposits[curr_d_idx]
+                    time_diff = (d.timestamp - w.timestamp).total_seconds()
+
+                    if time_diff > 86400: break # Window closed
+
+                    if d.id not in reconciled_ids:
+                        d_amt = d.amount_to or 0.0
+                        if d_amt <= w_amt and d_amt >= (w_amt * 0.95):
+                            w.is_taxable_event = 0
+                            d.is_taxable_event = 0
+                            w.linked_transaction_id = d.id
+                            d.linked_transaction_id = w.id
+                            w.category = "Transfer"
+                            d.category = "Transfer"
+                            reconciled_ids.update([w.id, d.id])
+
+                            fee_amount = w_amt - d_amt
+                            if fee_amount > 1e-10:
+                                w.fee_amount = (w.fee_amount or 0.0) + fee_amount
+                                w.fee_asset = w.asset_from
+                                w.issue_notes = (w.issue_notes or "") + f" | Transfer fee applied: {fee_amount} {w.asset_from}"
+                            break
+                    curr_d_idx += 1
+        return reconciled_ids
     async def _run_valuation(self, txs: List[Transaction], db: AsyncSession):
         if not txs: return
         
@@ -364,22 +359,14 @@ class TaxEngine:
                     
                     # Calculate Madad-adjusted gains from consumptions
                     total_inflationary = 0.0
-                    total_real = 0.0
-                    
-                    # If we have multiple consumptions, we apportion the proceeds by amount_consumed
                     for c in consumptions:
-                        c_proportion = c.amount_consumed / qty
-                        c_proceeds = proceeds * c_proportion
-                        
                         c.inflationary_gain_ils = c.adjusted_cost_basis_ils - c.ils_value_consumed
-                        c.real_gain_ils = c_proceeds - c.adjusted_cost_basis_ils
-                        
                         total_inflationary += c.inflationary_gain_ils
-                        total_real += c.real_gain_ils
                     
                     tx.inflationary_gain_ils = total_inflationary
-                    tx.real_gain_ils = total_real
                     tx.capital_gain_ils = total_nominal_gain
+                    # The math naturally forces any missing cost basis to become 100% real gain
+                    tx.real_gain_ils = total_nominal_gain - total_inflationary 
 
                     # Wash Sale Rule (Section 94B)
                     if use_wash_sale_rule and tx.capital_gain_ils < 0:
@@ -402,10 +389,13 @@ class TaxEngine:
                 tx.is_taxable_event = 0
                 tx.cost_basis_ils = 0.0 
             else:
-                if tx.type in [TransactionType.earn, TransactionType.airdrop, TransactionType.fork]:
+                if tx.type in [TransactionType.earn, TransactionType.airdrop]:
                     cost_basis = val_to
                     tx.is_taxable_event = 1
                     tx.ordinary_income_ils = cost_basis
+                elif tx.type == TransactionType.fork:
+                    cost_basis = 0.0
+                    tx.is_taxable_event = 0
                 else:
                     # Swap or Buy
                     cost_basis = effective_swap_value
@@ -425,19 +415,17 @@ class TaxEngine:
             fee_cost_basis, fee_consumptions = await ledger.consume_lots(fee_asset, fee_qty, tx)
             fee_proceeds = fee_ils
             
-            fee_gain = fee_proceeds - fee_cost_basis
+            fee_nominal_gain = fee_proceeds - fee_cost_basis
             
-            # Apportion Madad for fee disposal too
+            # Calculate Madad for fee disposal
+            fee_inflationary = 0.0
             for c in fee_consumptions:
-                c_proportion = c.amount_consumed / fee_qty
-                c_proceeds = fee_proceeds * c_proportion
                 c.inflationary_gain_ils = c.adjusted_cost_basis_ils - c.ils_value_consumed
-                c.real_gain_ils = c_proceeds - c.adjusted_cost_basis_ils
-                
-                tx.inflationary_gain_ils += c.inflationary_gain_ils
-                tx.real_gain_ils += c.real_gain_ils
+                fee_inflationary += c.inflationary_gain_ils
 
-            tx.capital_gain_ils += fee_gain
+            tx.inflationary_gain_ils += fee_inflationary
+            tx.capital_gain_ils += fee_nominal_gain
+            tx.real_gain_ils += (fee_nominal_gain - fee_inflationary)
             tx.is_taxable_event = 1
 
     async def get_kpi(self, db: AsyncSession, year: Optional[int] = None, tax_bracket: float = 0.25) -> Dict[str, Any]:
@@ -487,7 +475,7 @@ class TaxEngine:
             'year': year,
             'total_nominal_gain_ils': round(report_year_total_nominal_gain, 2),
             'ordinary_income_ils': round(report_year_ordinary, 2),
-            'net_real_capital_gain_ils': round(report_year_real_gain, 2),
+            'net_capital_gain_ils': round(report_year_real_gain, 2),
             'carried_forward_loss_ils': round(abs(min(0, accumulated_loss)), 2),
             'tax_bracket': tax_bracket,
             'estimated_tax_ils': round(max(0, (report_year_real_gain * 0.25) + (report_year_ordinary * tax_bracket)), 2),

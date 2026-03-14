@@ -3,6 +3,7 @@ import io
 from typing import List, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 from app.models.transaction import Transaction
 from app.models.tax_lot_consumption import TaxLotConsumption
 
@@ -13,17 +14,23 @@ class ExportService:
         Columns: Asset, Date of Purchase, Date of Sale, Amount, Original Cost Basis (ILS), 
                  Adjusted (Madad) Cost Basis (ILS), Proceeds (ILS), Real Gain (ILS), Inflationary Gain (ILS)
         """
-        # Join TaxLotConsumption with Sell and Buy transactions
+        BuyTx = aliased(Transaction)
+        SellTx = aliased(Transaction)
+
+        # Join TaxLotConsumption with Sell and Buy transactions in one query
         stmt = select(
             TaxLotConsumption, 
-            Transaction.timestamp.label('sell_date'),
-            Transaction.asset_from.label('asset')
+            SellTx.timestamp.label('sell_date'),
+            SellTx.asset_from.label('asset'),
+            BuyTx.timestamp.label('buy_date')
         ).join(
-            Transaction, TaxLotConsumption.sell_tx_id == Transaction.id
-        ).order_by(Transaction.timestamp.asc())
+            SellTx, TaxLotConsumption.sell_tx_id == SellTx.id
+        ).join(
+            BuyTx, TaxLotConsumption.buy_tx_id == BuyTx.id
+        ).order_by(SellTx.timestamp.asc())
         
         result = await db.execute(stmt)
-        consumptions = result.all() # List of (TaxLotConsumption, sell_date, asset)
+        consumptions = result.all()
 
         output = io.StringIO()
         writer = csv.writer(output)
@@ -33,33 +40,16 @@ class ExportService:
             "Proceeds (ILS)", "Real Gain (ILS)", "Inflationary Gain (ILS)"
         ])
 
-        for consumption_row in consumptions:
-            c: TaxLotConsumption = consumption_row[0]
-            sell_date = consumption_row[1]
-            asset = consumption_row[2]
+        for row in consumptions:
+            c: TaxLotConsumption = row[0]
+            sell_date = row[1]
+            asset = row[2]
+            buy_date = row[3]
             
             if year and sell_date.year != year:
                 continue
             
-            # Fetch buy transaction for purchase date
-            buy_stmt = select(Transaction.timestamp).where(Transaction.id == c.buy_tx_id)
-            buy_res = await db.execute(buy_stmt)
-            buy_date = buy_res.scalar_one()
-
-            # Proceeds for this lot consumption:
-            # We need to fetch the sell transaction's total proceeds to apportion it
-            # Or we can store proceeds in TaxLotConsumption. 
-            # Since we didn't store it, we'll calculate it here.
-            sell_stmt = select(Transaction).where(Transaction.id == c.sell_tx_id)
-            sell_res = await db.execute(sell_stmt)
-            sell_tx: Transaction = sell_res.scalar_one()
-            
-            # We use the same logic as in _process_transaction to get proceeds
-            # Note: This is a bit redundant, ideally we'd store proceeds_ils in TaxLotConsumption
-            # But we can reconstruct it.
-            
-            # For the export, real_gain_ils and inflationary_gain_ils are already in 'c'
-            # We can find proceeds by: proceeds = real_gain + adjusted_cost_basis
+            # Proceeds = real_gain + adjusted_cost_basis
             proceeds = (c.real_gain_ils or 0.0) + (c.adjusted_cost_basis_ils or 0.0)
 
             writer.writerow([
