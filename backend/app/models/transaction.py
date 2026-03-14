@@ -11,6 +11,8 @@ class TransactionType(str, enum.Enum):
     dust = "dust"
     earn = "earn"
     fee = "fee"
+    airdrop = "airdrop"
+    fork = "fork"
 
 class Transaction(Base):
     __tablename__ = "transactions"
@@ -37,6 +39,8 @@ class Transaction(Base):
     cost_basis_ils = Column(Float, nullable=True)
     purchase_date = Column(Date, nullable=True)
     capital_gain_ils = Column(Float, nullable=True)
+    inflationary_gain_ils = Column(Float, nullable=True) # Exempt portion (Israeli Rules)
+    real_gain_ils = Column(Float, nullable=True) # Taxable portion (Israeli Rules)
     ordinary_income_ils = Column(Float, nullable=True, default=0.0)
     is_taxable_event = Column(Integer, default=0) # 0 for false, 1 for true
 

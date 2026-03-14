@@ -41,6 +41,8 @@ class Transaction(TransactionBase):
     cost_basis_ils: Optional[float]
     purchase_date: Optional[date]
     capital_gain_ils: Optional[float]
+    inflationary_gain_ils: Optional[float] = 0.0
+    real_gain_ils: Optional[float] = 0.0
     ordinary_income_ils: Optional[float] = 0.0
     is_taxable_event: int = 0
     is_active: bool = True
@@ -56,9 +58,9 @@ class Transaction(TransactionBase):
 
 class KPIReport(BaseModel):
     year: Optional[int] = None
-    total_gain_ils: float
+    total_nominal_gain_ils: float
     ordinary_income_ils: float
-    net_capital_gain_ils: float
+    net_real_capital_gain_ils: float
     carried_forward_loss_ils: float
     tax_bracket: float
     estimated_tax_ils: float

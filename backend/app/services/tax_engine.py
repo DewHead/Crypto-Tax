@@ -3,6 +3,7 @@ from sqlalchemy import select, extract, distinct, delete
 from app.models.transaction import Transaction, TransactionType
 from app.models.tax_lot_consumption import TaxLotConsumption
 from app.services.boi import boi_service
+from app.services.cpi import cpi_service
 from app.services.price import price_service
 from datetime import datetime, date, timedelta
 from typing import List, Dict, Any, Optional, Set
@@ -17,19 +18,23 @@ class TaxLedger:
         self.inventory: Dict[str, List[Dict[str, Any]]] = {}
         self.recent_losses: Dict[str, List[Dict[str, Any]]] = {} # asset -> list of {'timestamp', 'loss_ils', 'amount'}
 
-    async def consume_lots(self, asset: str, qty: float, sell_tx: Transaction) -> float:
+    async def consume_lots(self, asset: str, qty: float, sell_tx: Transaction) -> tuple[float, List[TaxLotConsumption]]:
         logger.info(f"Consuming {qty} {asset} for TX {sell_tx.id} ({sell_tx.timestamp})")
         if asset not in self.inventory or not self.inventory[asset]:
             sell_tx.is_issue = True
             sell_tx.issue_notes = (sell_tx.issue_notes or "") + f" | Missing cost basis for {round(qty, 8)} {asset}."
-            return 0.0
+            return 0.0, []
 
         total_cost_basis_ils = 0.0
         qty_to_match = qty
+        consumptions = []
+        
+        cpi_sell = await cpi_service.get_cpi_index(sell_tx.timestamp.date(), self.db)
         
         while qty_to_match > 1e-10 and self.inventory[asset]:
             oldest_buy = self.inventory[asset][0]
             buy_tx_id = oldest_buy['tx_id']
+            buy_timestamp = oldest_buy['timestamp']
             
             if oldest_buy['amount'] <= qty_to_match:
                 matched_qty = oldest_buy['amount']
@@ -42,33 +47,43 @@ class TaxLedger:
                 oldest_buy['amount'] -= matched_qty
                 oldest_buy['cost_basis_ils'] -= matched_cost
 
+            # CPI Adjustment (Madad)
+            cpi_buy = await cpi_service.get_cpi_index(buy_timestamp.date(), self.db)
+            cpi_ratio = max(1.0, cpi_sell / cpi_buy)
+            
+            adjusted_cost_basis_ils = matched_cost * cpi_ratio
             total_cost_basis_ils += matched_cost
-            qty_to_match -= matched_qty
 
             # Record consumption for audit trail
             consumption = TaxLotConsumption(
                 sell_tx_id=sell_tx.id,
                 buy_tx_id=buy_tx_id,
                 amount_consumed=matched_qty,
-                ils_value_consumed=matched_cost
+                ils_value_consumed=matched_cost,
+                adjusted_cost_basis_ils=adjusted_cost_basis_ils
             )
             self.db.add(consumption)
+            consumptions.append(consumption)
 
-        return total_cost_basis_ils
+            qty_to_match -= matched_qty
 
-    def add_lot(self, asset: str, amount: float, cost_basis_ils: float, tx: Transaction):
+        return total_cost_basis_ils, consumptions
+
+    async def add_lot(self, asset: str, amount: float, cost_basis_ils: float, tx: Transaction):
         logger.info(f"Adding lot: {amount} {asset} at {cost_basis_ils} ILS from TX {tx.id} ({tx.timestamp})")
         if asset not in self.inventory:
             self.inventory[asset] = []
         
-        # 30-Day Wash Sale Rule (Section 94B): If we have recent deferred losses, add them to cost basis
+        # 30-Day Wash Sale Rule (Section 94B): Forward Part
+        # If we have recent deferred losses, add them to cost basis
         deferred_loss = 0.0
         if asset in self.recent_losses:
             remaining_buy_qty = amount
             retained_losses = []
             
             for loss_entry in self.recent_losses[asset]:
-                if tx.timestamp - loss_entry['timestamp'] <= timedelta(days=30) and remaining_buy_qty > 0:
+                # If loss was triggered within 30 days of this buy
+                if abs((tx.timestamp - loss_entry['timestamp']).total_seconds()) <= 30 * 86400 and remaining_buy_qty > 0:
                     # Calculate proportion
                     match_qty = min(remaining_buy_qty, loss_entry['amount'])
                     proportion = match_qty / loss_entry['amount']
@@ -94,15 +109,40 @@ class TaxLedger:
             'timestamp': tx.timestamp
         })
 
-    def record_loss(self, asset: str, loss_ils: float, amount: float, tx: Transaction):
-        if asset not in self.recent_losses:
-            self.recent_losses[asset] = []
-        self.recent_losses[asset].append({
-            'timestamp': tx.timestamp,
-            'loss_ils': loss_ils,
-            'amount': amount,
-            'tx_id': tx.id
-        })
+    async def record_loss(self, asset: str, loss_ils: float, amount: float, tx: Transaction):
+        # 30-Day Wash Sale Rule (Section 94B): Backward Part
+        # If we bought replacement assets 30 days BEFORE this loss-triggering sale
+        remaining_loss = loss_ils
+        remaining_qty = amount
+        
+        if asset in self.inventory:
+            # We look for lots in inventory acquired < 30 days before this sell
+            for lot in reversed(self.inventory[asset]):
+                if remaining_qty <= 0 or remaining_loss <= 0:
+                    break
+                    
+                time_diff = (tx.timestamp - lot['timestamp']).total_seconds()
+                if 0 < time_diff <= 30 * 86400: # Bought within 30 days before sale
+                    # This lot absorbs the loss
+                    absorb_qty = min(remaining_qty, lot['amount'])
+                    absorb_proportion = absorb_qty / amount
+                    absorb_loss = loss_ils * absorb_proportion
+                    
+                    lot['cost_basis_ils'] += absorb_loss
+                    remaining_loss -= absorb_loss
+                    remaining_qty -= absorb_qty
+                    
+                    logger.info(f"Backward Wash Sale: TX {tx.id} loss {absorb_loss} absorbed by lot from TX {lot['tx_id']}")
+
+        if remaining_loss > 1e-4:
+            if asset not in self.recent_losses:
+                self.recent_losses[asset] = []
+            self.recent_losses[asset].append({
+                'timestamp': tx.timestamp,
+                'loss_ils': remaining_loss,
+                'amount': remaining_qty,
+                'tx_id': tx.id
+            })
 
 class TaxEngine:
     def __init__(self):
@@ -176,38 +216,54 @@ class TaxEngine:
         withdrawals = [t for t in txs if t.is_active and t.type == TransactionType.withdrawal]
         deposits = [t for t in txs if t.is_active and t.type == TransactionType.deposit]
         
+        # Optimization: Group withdrawals by asset
+        w_by_asset: Dict[str, List[Transaction]] = {}
+        for w in withdrawals:
+            if w.asset_from not in w_by_asset:
+                w_by_asset[w.asset_from] = []
+            w_by_asset[w.asset_from].append(w)
+            
         reconciled_ids: Set[int] = set()
         
-        for w in withdrawals:
-            for d in deposits:
-                if d.id in reconciled_ids:
+        for d in deposits:
+            asset = d.asset_to
+            if asset not in w_by_asset:
+                continue
+                
+            d_amt = d.amount_to or 0.0
+            for w in w_by_asset[asset]:
+                if w.id in reconciled_ids:
                     continue
                 
                 time_diff = (d.timestamp - w.timestamp).total_seconds()
-                if 0 <= time_diff <= 86400: # 24 hours
-                    if d.asset_to == w.asset_from:
-                        # Heuristic: 5% fee variance
-                        d_amt = d.amount_to or 0.0
-                        w_amt = w.amount_from or 0.0
-                        if d_amt <= w_amt and d_amt >= (w_amt * 0.95):
-                            w.is_taxable_event = 0
-                            d.is_taxable_event = 0
-                            w.linked_transaction_id = d.id
-                            d.linked_transaction_id = w.id
-                            w.category = "Transfer"
-                            d.category = "Transfer"
-                            
-                            reconciled_ids.add(w.id)
-                            reconciled_ids.add(d.id)
-                            
-                            # Log transfer fee if any
-                            fee_amount = w_amt - d_amt
-                            if fee_amount > 1e-10:
-                                # Assign the lost amount as a fee so _process_transaction taxes it
-                                w.fee_amount = (w.fee_amount or 0.0) + fee_amount
-                                w.fee_asset = w.asset_from
-                                w.issue_notes = (w.issue_notes or "") + f" | Transfer fee applied: {fee_amount} {w.asset_from}"
-                            break
+                # Transfers usually take some time, but we allow up to 24h
+                if 0 <= time_diff <= 86400:
+                    w_amt = w.amount_from or 0.0
+                    # Heuristic: 5% fee variance
+                    if d_amt <= w_amt and d_amt >= (w_amt * 0.95):
+                        w.is_taxable_event = 0
+                        d.is_taxable_event = 0
+                        w.linked_transaction_id = d.id
+                        d.linked_transaction_id = w.id
+                        w.category = "Transfer"
+                        d.category = "Transfer"
+                        
+                        reconciled_ids.add(w.id)
+                        reconciled_ids.add(d.id)
+                        
+                        fee_amount = w_amt - d_amt
+                        if fee_amount > 1e-10:
+                            w.fee_amount = (w.fee_amount or 0.0) + fee_amount
+                            w.fee_asset = w.asset_from
+                            w.issue_notes = (w.issue_notes or "") + f" | Transfer fee applied: {fee_amount} {w.asset_from}"
+                        break
+                elif time_diff > 86400:
+                    # Since withdrawals are sorted by time, we can stop if we're too far in the future
+                    # Actually deposits are sorted too. 
+                    # If this deposit is already > 24h after this withdrawal, 
+                    # we should probably skip this withdrawal for FUTURE deposits too?
+                    # No, this loop is over d, so we can't easily skip for future d's without more complex logic.
+                    pass
         return reconciled_ids
 
     async def _run_valuation(self, txs: List[Transaction], db: AsyncSession):
@@ -250,6 +306,8 @@ class TaxEngine:
     async def _process_transaction(self, tx: Transaction, ledger: TaxLedger, reconciled_ids: Set[int], db: AsyncSession, use_wash_sale_rule: bool = False):
         # Reset results
         tx.capital_gain_ils = 0.0
+        tx.inflationary_gain_ils = 0.0
+        tx.real_gain_ils = 0.0
         tx.cost_basis_ils = 0.0
         tx.ordinary_income_ils = 0.0
         tx.is_taxable_event = 0
@@ -263,9 +321,10 @@ class TaxEngine:
             tx_amt_from = tx.amount_from or 0.0
             pnl_amount = tx_amt_to if tx_amt_to > 0 else -tx_amt_from
             tx.capital_gain_ils = pnl_amount * rate
+            tx.real_gain_ils = tx.capital_gain_ils # Futures usually have no Madad adjustment
             tx.is_taxable_event = 1
             if tx_amt_to > 0:
-                ledger.add_lot(tx.asset_to, tx_amt_to, tx.capital_gain_ils, tx)
+                await ledger.add_lot(tx.asset_to, tx_amt_to, tx.capital_gain_ils, tx)
             return
 
         # Pre-calculate values
@@ -291,34 +350,48 @@ class TaxEngine:
             is_fiat = asset in ['USD', 'ILS']
 
             if tx.id not in reconciled_ids:
-                cost_basis = await ledger.consume_lots(asset, qty, tx) if not is_fiat else 0.0
+                cost_basis, consumptions = await ledger.consume_lots(asset, qty, tx) if not is_fiat else (0.0, [])
 
                 # Valuation of proceeds: If swap, use effective_swap_value
                 proceeds = (effective_swap_value if amt_to > 0 else val_from) - fee_ils
-
-                # Fallback for missing cost basis: ITA default assumes ZERO
-                if cost_basis == 0 and qty > 0 and not is_fiat:
-                    tx.is_issue = True
-                    tx.issue_notes = (tx.issue_notes or "") + " | Missing cost basis. ITA default assumes ZERO."
-                    logger.warning(f"MISSING COST BASIS: {tx.timestamp} {asset} qty={qty}. Assumed ZERO.")
 
                 tx.cost_basis_ils = cost_basis
 
                 # ITA Rule: Stablecoins are NOT fiat.
                 if not is_fiat and tx.type != TransactionType.withdrawal:
                     tx.is_taxable_event = 1
-                    gain = proceeds - cost_basis
+                    total_nominal_gain = proceeds - cost_basis
+                    
+                    # Calculate Madad-adjusted gains from consumptions
+                    total_inflationary = 0.0
+                    total_real = 0.0
+                    
+                    # If we have multiple consumptions, we apportion the proceeds by amount_consumed
+                    for c in consumptions:
+                        c_proportion = c.amount_consumed / qty
+                        c_proceeds = proceeds * c_proportion
+                        
+                        c.inflationary_gain_ils = c.adjusted_cost_basis_ils - c.ils_value_consumed
+                        c.real_gain_ils = c_proceeds - c.adjusted_cost_basis_ils
+                        
+                        total_inflationary += c.inflationary_gain_ils
+                        total_real += c.real_gain_ils
+                    
+                    tx.inflationary_gain_ils = total_inflationary
+                    tx.real_gain_ils = total_real
+                    tx.capital_gain_ils = total_nominal_gain
 
                     # Wash Sale Rule (Section 94B)
-                    if use_wash_sale_rule and gain < 0:
-                        ledger.record_loss(asset, abs(gain), qty, tx)
-                        tx.capital_gain_ils = 0.0 # Deferred
-                    else:
-                        tx.capital_gain_ils = gain
+                    if use_wash_sale_rule and tx.capital_gain_ils < 0:
+                        await ledger.record_loss(asset, abs(tx.capital_gain_ils), qty, tx)
+                        # We defer the loss, so we zero out the taxable gains for this TX
+                        tx.capital_gain_ils = 0.0
+                        tx.real_gain_ils = 0.0
+                        tx.inflationary_gain_ils = 0.0
                 else:
                     tx.is_taxable_event = 0
 
-        # 3. Process Acquisition (Buy / Deposit / Earn)
+        # 3. Process Acquisition (Buy / Deposit / Earn / Airdrop / Fork)
         is_buy = amt_to > 0 and tx.asset_to
         if is_buy:
             asset = tx.asset_to
@@ -329,7 +402,7 @@ class TaxEngine:
                 tx.is_taxable_event = 0
                 tx.cost_basis_ils = 0.0 
             else:
-                if tx.type == TransactionType.earn:
+                if tx.type in [TransactionType.earn, TransactionType.airdrop, TransactionType.fork]:
                     cost_basis = val_to
                     tx.is_taxable_event = 1
                     tx.ordinary_income_ils = cost_basis
@@ -338,7 +411,7 @@ class TaxEngine:
                     cost_basis = effective_swap_value
 
                 cost_basis += fee_ils
-                ledger.add_lot(asset, qty, cost_basis, tx)
+                await ledger.add_lot(asset, qty, cost_basis, tx)
                 
                 if not is_sell and tx.type != TransactionType.deposit:
                     tx.cost_basis_ils = cost_basis
@@ -347,24 +420,25 @@ class TaxEngine:
         # 4. Handle Crypto Fee Disposals (CRITICAL ITA)
         f_amt = tx.fee_amount or 0.0
         if f_amt > 0 and tx.fee_asset and tx.fee_asset not in ['USD', 'ILS']:
-            # This is a separate disposal of the fee asset
             fee_asset = tx.fee_asset
             fee_qty = f_amt
-            fee_cost_basis = await ledger.consume_lots(fee_asset, fee_qty, tx)
-            
-            # Proceeds of fee disposal is its FMV
+            fee_cost_basis, fee_consumptions = await ledger.consume_lots(fee_asset, fee_qty, tx)
             fee_proceeds = fee_ils
             
-            # Fallback for missing cost basis: ITA default assumes ZERO
-            if fee_cost_basis == 0 and fee_qty > 0:
-                tx.is_issue = True
-                tx.issue_notes = (tx.issue_notes or "") + f" | Missing cost basis for fee ({fee_asset}). ITA default assumes ZERO."
-
-            # Capital gain on the fee itself
             fee_gain = fee_proceeds - fee_cost_basis
+            
+            # Apportion Madad for fee disposal too
+            for c in fee_consumptions:
+                c_proportion = c.amount_consumed / fee_qty
+                c_proceeds = fee_proceeds * c_proportion
+                c.inflationary_gain_ils = c.adjusted_cost_basis_ils - c.ils_value_consumed
+                c.real_gain_ils = c_proceeds - c.adjusted_cost_basis_ils
+                
+                tx.inflationary_gain_ils += c.inflationary_gain_ils
+                tx.real_gain_ils += c.real_gain_ils
+
             tx.capital_gain_ils += fee_gain
             tx.is_taxable_event = 1
-            # Note: fee_cost_basis is already added to cost_basis_ils of the main transaction above
 
     async def get_kpi(self, db: AsyncSession, year: Optional[int] = None, tax_bracket: float = 0.25) -> Dict[str, Any]:
         stmt = select(Transaction).order_by(Transaction.timestamp.asc())
@@ -372,10 +446,10 @@ class TaxEngine:
         all_txs = result.scalars().all()
         
         accumulated_loss = 0.0
-        report_year_gain = 0.0
+        report_year_real_gain = 0.0
         report_year_ordinary = 0.0
         report_year_trade_count = 0
-        report_year_total_gain = 0.0 
+        report_year_total_nominal_gain = 0.0 
         
         txs_by_year: Dict[int, List[Transaction]] = {}
         for tx in all_txs:
@@ -385,36 +459,38 @@ class TaxEngine:
             txs_by_year[y].append(tx)
         
         for y in sorted(txs_by_year.keys()):
-            y_gain = sum(t.capital_gain_ils or 0.0 for t in txs_by_year[y] if t.is_taxable_event)
+            # ITA Rule: Tax is on Real Gain. 
+            # If Real Gain < 0, it's a loss that can offset other capital gains.
+            y_nominal_gain = sum(t.capital_gain_ils or 0.0 for t in txs_by_year[y] if t.is_taxable_event)
+            y_real_gain = sum(t.real_gain_ils or 0.0 for t in txs_by_year[y] if t.is_taxable_event)
             y_ordinary = sum(t.ordinary_income_ils or 0.0 for t in txs_by_year[y])
             
             if year and y < year:
-                accumulated_loss += y_gain
+                accumulated_loss += y_real_gain
                 if accumulated_loss > 0: accumulated_loss = 0.0 
             elif year is None or y == year:
-                if year == y or year is None:
-                    report_year_trade_count += len([t for t in txs_by_year[y] if t.is_taxable_event and t.capital_gain_ils != 0])
-                    report_year_total_gain += y_gain
-                    report_year_ordinary += y_ordinary
-                    
-                    net_gain = y_gain + accumulated_loss
-                    if net_gain < 0:
-                        report_year_gain = 0.0
-                        accumulated_loss = net_gain 
-                    else:
-                        report_year_gain = net_gain
-                        accumulated_loss = 0.0
+                report_year_trade_count += len([t for t in txs_by_year[y] if t.is_taxable_event and t.capital_gain_ils != 0])
+                report_year_total_nominal_gain += y_nominal_gain
+                report_year_ordinary += y_ordinary
+                
+                net_real_gain = y_real_gain + accumulated_loss
+                if net_real_gain < 0:
+                    report_year_real_gain = 0.0
+                    accumulated_loss = net_real_gain 
+                else:
+                    report_year_real_gain = net_real_gain
+                    accumulated_loss = 0.0
         
         all_tx_count = len([t for t in all_txs if (year is None or t.timestamp.year == year) and t.is_active])
         
         return {
             'year': year,
-            'total_gain_ils': round(report_year_total_gain, 2),
+            'total_nominal_gain_ils': round(report_year_total_nominal_gain, 2),
             'ordinary_income_ils': round(report_year_ordinary, 2),
-            'net_capital_gain_ils': round(report_year_gain, 2),
+            'net_real_capital_gain_ils': round(report_year_real_gain, 2),
             'carried_forward_loss_ils': round(abs(min(0, accumulated_loss)), 2),
             'tax_bracket': tax_bracket,
-            'estimated_tax_ils': round(max(0, (report_year_gain + report_year_ordinary) * tax_bracket), 2),
+            'estimated_tax_ils': round(max(0, (report_year_real_gain * 0.25) + (report_year_ordinary * tax_bracket)), 2),
             'trade_count': report_year_trade_count,
             'total_transactions': all_tx_count,
             'high_frequency_warning': report_year_trade_count > 100
