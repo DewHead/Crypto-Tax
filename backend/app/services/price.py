@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 class PriceService:
     def __init__(self):
         self.cache: Dict[str, Dict[date, float]] = {}
+        self.negative_cache: Dict[str, Set[date]] = {}
         self._binance = None
         self._kraken = None
 
@@ -64,6 +65,9 @@ class PriceService:
         if mapped_asset in self.cache and target_date in self.cache[mapped_asset]:
             return self.cache[mapped_asset][target_date]
         
+        if mapped_asset in self.negative_cache and target_date in self.negative_cache[mapped_asset]:
+            return None
+        
         dt = datetime.combine(target_date, datetime.min.time())
         ts = int(dt.timestamp() * 1000)
         
@@ -108,6 +112,11 @@ class PriceService:
                             if mapped_asset not in self.cache: self.cache[mapped_asset] = {}
                             self.cache[mapped_asset][target_date] = price
                             return price
+        
+        # If we reached here, no price was found
+        if mapped_asset not in self.negative_cache:
+            self.negative_cache[mapped_asset] = set()
+        self.negative_cache[mapped_asset].add(target_date)
         return None
 
     async def get_current_price(self, asset: str) -> Optional[float]:

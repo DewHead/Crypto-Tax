@@ -10,6 +10,8 @@ from app.models.exchange_key import ExchangeKey
 from app.models.ils_rate import ILSRate
 from app.models.cpi_rate import CPIRate
 from app.models.tax_lot_consumption import TaxLotConsumption
+from app.models.daily_valuation import DailyValuation
+from app.models.app_setting import AppSetting
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

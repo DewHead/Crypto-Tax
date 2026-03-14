@@ -48,12 +48,39 @@ export const fetchDataSources = async (): Promise<DataSource[]> => {
   return response.data;
 };
 
+export interface AppSetting {
+  key: string;
+  value: string | null;
+}
+
+export const fetchSetting = async (key: string): Promise<AppSetting> => {
+  const response = await api.get(`/settings/${key}`);
+  return response.data;
+};
+
+export const updateSetting = async (key: string, value: string | null): Promise<AppSetting> => {
+  const response = await api.post(`/settings/${key}`, { value });
+  return response.data;
+};
+
 export const deleteDataSource = async (exchangeName: string): Promise<void> => {
   await api.delete(`/data-sources/${exchangeName}`);
 };
 
 export const syncKey = async (id: number): Promise<void> => {
   await api.post(`/sync/${id}`);
+};
+
+export const syncAllData = async (): Promise<void> => {
+  await api.post('/sync');
+};
+
+export const recalculateTaxes = async (): Promise<void> => {
+  await api.post('/recalculate');
+};
+
+export const sendTestEmail = async (): Promise<void> => {
+  await api.post('/test-email');
 };
 
 export const updateManualCostBasis = async (txId: number, manualCostBasisIls: number, manualPurchaseDate?: string): Promise<void> => {

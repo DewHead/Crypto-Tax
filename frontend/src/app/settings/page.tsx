@@ -1,6 +1,8 @@
 import ApiKeysManager from '@/components/ApiKeysManager';
 import HistoryUploader from '@/components/HistoryUploader';
 import DisplaySettings from '@/components/DisplaySettings';
+import NotificationSettings from '@/components/NotificationSettings';
+import MaintenanceSettings from '@/components/MaintenanceSettings';
 import Link from 'next/link';
 
 export default function SettingsPage() {
@@ -16,21 +18,12 @@ export default function SettingsPage() {
           </Link>
         </div>
       </header>
-      <main className="flex-1 space-y-10 p-10 pt-8 container mx-auto max-w-7xl">
-        <section>
-          <h2 className="text-xl font-semibold mb-6">Display Preferences</h2>
-          <DisplaySettings />
-        </section>
-
-        <section>
-          <h2 className="text-xl font-semibold mb-6">Historical Data</h2>
-          <HistoryUploader />
-        </section>
-        
-        <section>
-          <h2 className="text-xl font-semibold mb-6">Exchange API Keys</h2>
-          <ApiKeysManager />
-        </section>
+      <main className="flex-1 space-y-8 p-10 pt-8 container mx-auto max-w-7xl">
+        <DisplaySettings />
+        <NotificationSettings />
+        <MaintenanceSettings />
+        <HistoryUploader />
+        <ApiKeysManager />
       </main>
     </div>
   );
