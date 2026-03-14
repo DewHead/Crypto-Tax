@@ -16,7 +16,7 @@ class CPIService:
     def __init__(self):
         self.cache: Dict[date, float] = {}
         self.prefetched_ranges: List[tuple] = []
-        self.base_url = "https://edge.boi.gov.il/FusionEdgeServer/sdmx/v2/data/dataflow/BOI.STATISTICS/CPI/1.0/CPI_TOTAL"
+        self.base_url = "https://edge.boi.org.il/FusionEdgeServer/sdmx/v2/data/dataflow/BOI.STATISTICS/PRI/1.0/CP"
         self._lock = asyncio.Lock()
 
     async def _load_from_db(self, start_date: date, end_date: date, db: Optional[AsyncSession] = None):
@@ -148,7 +148,7 @@ class CPIService:
         reader = csv.DictReader(f)
         parsed_rates = {}
         for row in reader:
-            if row.get('SERIES_CODE') == 'CPI_TOTAL':
+            if row.get('SERIES_CODE') == 'CP':
                 try:
                     # TIME_PERIOD is usually 'YYYY-MM'
                     time_period = row['TIME_PERIOD']
