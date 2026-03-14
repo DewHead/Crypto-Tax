@@ -1,6 +1,8 @@
 import csv
 import io
 from typing import List, Optional
+from datetime import timezone
+from zoneinfo import ZoneInfo
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -42,11 +44,22 @@ class ExportService:
 
         for row in consumptions:
             c: TaxLotConsumption = row[0]
-            sell_date = row[1]
-            asset = row[2]
-            buy_date = row[3]
             
-            if year and sell_date.year != year:
+            # Localize the timestamps to Israel Time
+            sell_dt = row[1]
+            if sell_dt.tzinfo is None:
+                sell_dt = sell_dt.replace(tzinfo=timezone.utc)
+            sell_date_local = sell_dt.astimezone(ZoneInfo("Asia/Jerusalem"))
+            
+            buy_dt = row[3]
+            if buy_dt.tzinfo is None:
+                buy_dt = buy_dt.replace(tzinfo=timezone.utc)
+            buy_date_local = buy_dt.astimezone(ZoneInfo("Asia/Jerusalem"))
+
+            asset = row[2]
+            
+            # Check the local year, not the UTC year
+            if year and sell_date_local.year != year:
                 continue
             
             # Proceeds = real_gain + adjusted_cost_basis
@@ -54,8 +67,8 @@ class ExportService:
 
             writer.writerow([
                 asset,
-                buy_date.strftime("%d/%m/%Y"),
-                sell_date.strftime("%d/%m/%Y"),
+                buy_date_local.strftime("%d/%m/%Y"),
+                sell_date_local.strftime("%d/%m/%Y"),
                 f"{c.amount_consumed:.8f}",
                 f"{c.ils_value_consumed:.2f}",
                 f"{c.adjusted_cost_basis_ils:.2f}",

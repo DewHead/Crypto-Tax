@@ -49,8 +49,7 @@ class TaxLedger:
                 self.inventory[asset].pop(0)
             else:
                 matched_qty = qty_to_match
-                unit_cost = oldest_buy['cost_basis_ils'] / oldest_buy['amount']
-                matched_cost = unit_cost * matched_qty
+                matched_cost = oldest_buy['cost_basis_ils'] * (matched_qty / oldest_buy['amount'])
                 oldest_buy['amount'] -= matched_qty
                 oldest_buy['cost_basis_ils'] -= matched_cost
 
@@ -97,15 +96,18 @@ class TaxLedger:
                     match_loss = loss_entry['loss_ils'] * proportion
                     
                     deferred_loss += match_loss
-                    loss_entry['loss_ils'] -= match_loss
-                    loss_entry['amount'] -= match_qty
                     remaining_buy_qty -= match_qty
                     
-                    logger.info(f"Wash Sale: TX {tx.id} lot increased by {match_loss} ILS from deferred loss on TX {loss_entry['tx_id']}")
-                
-                if loss_entry['amount'] > 1e-10:
+                    # Update the deferred loss entry
+                    loss_entry['amount'] -= match_qty
+                    loss_entry['loss_ils'] -= match_loss
+                    
+                    if loss_entry['amount'] > 1e-8:
+                        retained_losses.append(loss_entry)
+                    
+                    logger.info(f"Wash Sale: TX {tx.id} deferred {match_loss} loss from TX {loss_entry['tx_id']}")
+                else:
                     retained_losses.append(loss_entry)
-            
             self.recent_losses[asset] = retained_losses
 
         self.inventory[asset].append({
@@ -154,38 +156,42 @@ class TaxEngine:
     def __init__(self):
         pass
 
-    async def run_tax_pipeline(self, db: AsyncSession, year: Optional[int] = None, use_wash_sale_rule: bool = False):
-        """
-        Main pipeline to process transactions and update capital gains.
-        1. Fetch all transactions (ordered by time).
-        2. Filter out non-taxable internal transfers.
-        3. Merge simultaneous 'dust' or small trades (Avalanche Merger).
-        4. Run valuation to get ILS values for all movements.
-        5. Run the FIFO tax engine.
-        """
-        # 1. Fetch
-        stmt = select(Transaction).order_by(Transaction.timestamp.asc())
+    async def calculate_taxes(self, db: AsyncSession):
+        logger.info("Starting tax calculation pipeline...")
+        # 1. Fetch all active transactions
+        stmt = select(Transaction).filter(Transaction.is_active == True).order_by(Transaction.timestamp.asc())
         result = await db.execute(stmt)
-        all_txs = result.scalars().all()
+        txs = result.scalars().all()
         
-        # 2. Merger
-        await self._run_avalanche_merger(all_txs, db)
-        
-        # 3. Transfers
-        reconciled_ids = await self._run_transfer_reconciliation(all_txs, db)
-        
-        # 4. Valuation
-        active_txs = [t for t in all_txs if t.is_active]
-        await self._run_valuation(active_txs, db)
-        
-        # 5. FIFO Engine
-        ledger = TaxLedger(db)
-        for tx in active_txs:
-            await self._process_transaction(tx, ledger, reconciled_ids, db, use_wash_sale_rule=use_wash_sale_rule)
+        if not txs:
+            logger.info("No transactions found. Skipping calculation.")
+            return
 
+        # 2. Avalanche Merger (Consolidate dust/swaps)
+        await self._run_avalanche_merger(txs, db)
+        
+        # 3. Transfer Reconciliation
+        reconciled_ids = await self._run_transfer_reconciliation(txs, db)
+        
+        # 4. Valuation (Prefetch boi rates)
+        await self._run_valuation(txs, db)
+        
+        # 5. FIFO Processing
+        ledger = TaxLedger(db)
+        
+        # Clear old consumptions
+        await db.execute(delete(TaxLotConsumption))
+        
+        for tx in txs:
+            if not tx.is_active: continue
+            await self._process_transaction(tx, ledger, reconciled_ids, db, use_wash_sale_rule=True)
+            
         await db.commit()
+        logger.info("Tax calculation pipeline completed.")
 
     async def _run_avalanche_merger(self, txs: List[Transaction], db: AsyncSession):
+        # Merges sequential small swaps/conversions of the same asset pair within 1 second
+        # This prevents inventory fragmentation and huge audit reports.
         i = 0
         while i < len(txs):
             curr = txs[i]
@@ -195,30 +201,31 @@ class TaxEngine:
                 continue
             
             j = i + 1
-            merged_count = 0
             while j < len(txs):
                 nxt = txs[j]
+                if not nxt.is_active: 
+                    j += 1
+                    continue
+                
                 time_diff = (nxt.timestamp - curr.timestamp).total_seconds()
-                if (nxt.is_active and
-                    nxt.exchange == curr.exchange and 
-                    nxt.type == curr.type and 
+                if time_diff > 1.0: break
+                
+                if (nxt.exchange == curr.exchange and 
                     nxt.asset_from == curr.asset_from and 
                     nxt.asset_to == curr.asset_to and 
-                    time_diff <= 5):
+                    nxt.type == curr.type):
                     
+                    # Merge nxt into curr
                     curr.amount_from = (curr.amount_from or 0.0) + (nxt.amount_from or 0.0)
                     curr.amount_to = (curr.amount_to or 0.0) + (nxt.amount_to or 0.0)
                     curr.fee_amount = (curr.fee_amount or 0.0) + (nxt.fee_amount or 0.0)
                     
                     nxt.is_active = False
                     nxt.parent_tx_id = curr.id
-                    merged_count += 1
+                    logger.info(f"Avalanche Merger: TX {nxt.id} merged into TX {curr.id}")
                     j += 1
                 else:
                     break
-            
-            if merged_count > 0:
-                curr.raw_data = (curr.raw_data or "") + f" | Merged {merged_count + 1} trades."
             i = j
 
     async def _run_transfer_reconciliation(self, txs: List[Transaction], db: AsyncSession) -> Set[int]:
@@ -289,21 +296,14 @@ class TaxEngine:
     async def get_ils_value(self, asset: str, amount: float, tx_date: date, usd_ils_rate: float) -> float:
         if not asset or amount == 0:
             return 0.0
-        if asset == 'ILS':
-            return amount
-
-        rate = usd_ils_rate or 3.65
-
-        if asset in ['USD', 'USDT', 'USDC', 'BUSD', 'DAI']:
-            return amount * rate
-
-        usd_price = await price_service.get_historical_price(asset, tx_date)
-        if usd_price is not None:
-            val = amount * usd_price * rate
-            logger.info(f"Price: {asset} on {tx_date} is ${usd_price}, ILS value: {val}")
-            return val
-
-        logger.warning(f"MISSING PRICE: {asset} on {tx_date}")
+        
+        if asset == 'ILS': return amount
+        if asset == 'USD': return amount * usd_ils_rate
+        
+        price_usd = await price_service.get_historical_price(asset, tx_date)
+        if price_usd:
+            return amount * price_usd * usd_ils_rate
+        
         return 0.0
 
     async def _process_transaction(self, tx: Transaction, ledger: TaxLedger, reconciled_ids: Set[int], db: AsyncSession, use_wash_sale_rule: bool = False):
@@ -335,13 +335,11 @@ class TaxEngine:
         amt_to = tx.amount_to or 0.0
         val_from = await self.get_ils_value(tx.asset_from, amt_from, tx_date, rate)
         val_to = await self.get_ils_value(tx.asset_to, amt_to, tx_date, rate)
-        fee_ils = await self.get_ils_value(tx.fee_asset, tx.fee_amount or 0.0, tx_date, rate)
+        fee_ils = await self.get_ils_value(tx.fee_asset, tx.fee_amount, tx_date, rate)
 
-        # For swaps, we use fiat value if available, otherwise FMV of acquired/disposed asset.
-        if tx.asset_from in ['USD', 'ILS']:
-            effective_swap_value = val_from
-        elif tx.asset_to in ['USD', 'ILS']:
-            effective_swap_value = val_to
+        # Effective Swap Value (FMV of the transaction)
+        if val_from > 0 and val_to > 0:
+            effective_swap_value = (val_from + val_to) / 2
         else:
             effective_swap_value = val_to if val_to > 0 else val_from
 
@@ -400,9 +398,9 @@ class TaxEngine:
         if is_buy:
             asset = tx.asset_to
             qty = amt_to
+            is_fiat = asset in ['USD', 'ILS']
 
-            # If it's a reconciled transfer, skip adding to ledger completely
-            if tx.id in reconciled_ids:
+            if is_fiat:
                 tx.is_taxable_event = 0
                 tx.cost_basis_ils = 0.0 
             else:
@@ -422,7 +420,6 @@ class TaxEngine:
                 
                 if not is_sell and tx.type != TransactionType.deposit:
                     tx.cost_basis_ils = cost_basis
-
 
         # 4. Handle Crypto Fee Disposals (CRITICAL ITA)
         f_amt = tx.fee_amount or 0.0

@@ -54,3 +54,5 @@ temp_csv/
 .pi/
 .zencoder/
 skills-lock.json
+
+gha-creds-*.json
