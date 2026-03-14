@@ -36,7 +36,7 @@ export default function HeaderAlert() {
     <div className="flex items-center gap-3">
       {isSyncing && (
         <Tooltip>
-          <TooltipTrigger className="flex items-center gap-2 px-3 py-1 rounded-full bg-primary/10 text-primary border border-primary/20 hover:bg-primary/20 transition-colors animate-in fade-in slide-in-from-right-4 duration-500">
+          <TooltipTrigger className="flex items-center gap-2 px-3 py-1 rounded-full bg-primary/10 text-primary border border-primary/20 hover:bg-primary/20 transition-colors animate-in fade-in slide-in-from-end-4 duration-500">
             <RefreshCw className="w-4 h-4 animate-spin" />
             <span className="text-xs font-bold uppercase tracking-wider hidden sm:inline">Syncing</span>
           </TooltipTrigger>
@@ -50,7 +50,7 @@ export default function HeaderAlert() {
 
       {kpi?.is_business_threshold_crossed && (
         <Tooltip>
-          <TooltipTrigger className="flex items-center gap-2 px-3 py-1 rounded-full bg-destructive/10 text-destructive border border-destructive/20 hover:bg-destructive/20 transition-colors animate-in fade-in slide-in-from-right-4 duration-500">
+          <TooltipTrigger className="flex items-center gap-2 px-3 py-1 rounded-full bg-destructive/10 text-destructive border border-destructive/20 hover:bg-destructive/20 transition-colors animate-in fade-in slide-in-from-end-4 duration-500">
             <AlertCircle className="w-4 h-4 animate-pulse" />
             <span className="text-xs font-bold uppercase tracking-wider hidden sm:inline">ITA Alert</span>
           </TooltipTrigger>
@@ -69,4 +69,3 @@ export default function HeaderAlert() {
     </div>
   );
 }
-
