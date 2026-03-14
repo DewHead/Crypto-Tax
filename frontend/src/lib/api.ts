@@ -63,8 +63,8 @@ export const updateSetting = async (key: string, value: string | null): Promise<
   return response.data;
 };
 
-export const deleteDataSource = async (exchangeName: string): Promise<void> => {
-  await api.delete(`/data-sources/${exchangeName}`);
+export const deleteDataSource = async (exchangeName: string, wipeCsv: boolean = false): Promise<void> => {
+  await api.delete(`/data-sources/${exchangeName}`, { params: { wipe_csv: wipeCsv } });
 };
 
 export const syncKey = async (id: number): Promise<void> => {

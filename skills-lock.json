@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "skills": {
+    "ccxt-python": {
+      "source": "ccxt/ccxt",
+      "sourceType": "github",
+      "computedHash": "a1781c81c8bc00f2333e48dd40e3ea00a7896c9b652bcb04862f1299467e7b67"
+    },
+    "crypto-report": {
+      "source": "claude-office-skills/skills",
+      "sourceType": "github",
+      "computedHash": "2b809a4ce2d28a193b4a9105d66669454a7308cb4c441aa8f611f675384234ba"
+    },
+    "fastapi-async-patterns": {
+      "source": "thebushidocollective/han",
+      "sourceType": "github",
+      "computedHash": "cd39488c82cb6f9db2a91489a57eb1f99f8333072fb4db5386a45d343fd07908"
+    },
+    "shadcn-ui": {
+      "source": "google-labs-code/stitch-skills",
+      "sourceType": "github",
+      "computedHash": "dadbca54d35a33fe73e40018611af2179689305bf6da812ab2643987fefd9da3"
+    },
+    "spot": {
+      "source": "binance/binance-skills-hub",
+      "sourceType": "github",
+      "computedHash": "97ab6d55b54e3f3a9aeca6e3d6472148a02c39158e2a87c993f6e228cde536a5"
+    },
+    "tanstack-query-best-practices": {
+      "source": "deckardger/tanstack-agent-skills",
+      "sourceType": "github",
+      "computedHash": "21d2e8b7468a81d772b6527ad8ca178cc2f3f08af777bb9061333013ee88a0c9"
+    },
+    "typescript-advanced-types": {
+      "source": "wshobson/agents",
+      "sourceType": "github",
+      "computedHash": "3a3be8c925f96ac4e1280db28a01677e7ca5197f3792de2bbf35ab3bb324b6dd"
+    }
+  }
+}

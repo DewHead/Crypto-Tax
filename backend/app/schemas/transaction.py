@@ -5,7 +5,7 @@ from app.models.transaction import TransactionType
 
 class TransactionBase(BaseModel):
     exchange: str
-    tx_hash: Optional[str]
+    tx_hash: Optional[str] = None
     timestamp: datetime
     type: TransactionType
     asset_from: Optional[str] = None
@@ -13,7 +13,7 @@ class TransactionBase(BaseModel):
     asset_to: Optional[str] = None
     amount_to: Optional[float] = 0.0
     fee_asset: Optional[str] = None
-    fee_amount: float = 0.0
+    fee_amount: Optional[float] = 0.0
     source: str = "api"
     raw_data: Optional[str] = None
     is_issue: bool = False
@@ -40,13 +40,13 @@ class ManualCostBasisUpdate(BaseModel):
 
 class Transaction(TransactionBase):
     id: int
-    ils_rate_date: Optional[date]
-    ils_exchange_rate: Optional[float]
-    cost_basis_ils: Optional[float]
-    purchase_date: Optional[date]
-    manual_cost_basis_ils: Optional[float]
-    manual_purchase_date: Optional[date]
-    capital_gain_ils: Optional[float]
+    ils_rate_date: Optional[date] = None
+    ils_exchange_rate: Optional[float] = 0.0
+    cost_basis_ils: Optional[float] = 0.0
+    purchase_date: Optional[date] = None
+    manual_cost_basis_ils: Optional[float] = 0.0
+    manual_purchase_date: Optional[date] = None
+    capital_gain_ils: Optional[float] = 0.0
     inflationary_gain_ils: Optional[float] = 0.0
     real_gain_ils: Optional[float] = 0.0
     ordinary_income_ils: Optional[float] = 0.0
@@ -54,10 +54,20 @@ class Transaction(TransactionBase):
     is_active: bool = True
     parent_tx_id: Optional[int] = None
 
-    @field_validator('ils_exchange_rate', 'cost_basis_ils', 'capital_gain_ils', 'ordinary_income_ils', 'is_taxable_event', mode='before')
+    @field_validator(
+        'ils_exchange_rate', 'cost_basis_ils', 'capital_gain_ils', 
+        'inflationary_gain_ils', 'real_gain_ils', 'ordinary_income_ils', 
+        'is_taxable_event', 'manual_cost_basis_ils',
+        mode='before'
+    )
     @classmethod
     def set_default_zero_extra(cls, v):
-        return v if v is not None else 0
+        if v is None:
+            return 0.0
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return 0.0
 
     class Config:
         from_attributes = True

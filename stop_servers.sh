@@ -38,8 +38,18 @@ kill_pattern "uvicorn" "Backend (Uvicorn)"
 # Kill frontend (Next.js/Node)
 kill_pattern "node.*next" "Frontend (Next.js)"
 
-# General cleanup for any orphaned python main.py processes
-kill_pattern "python.*main.py" "Orphaned Python processes"
+# Kill any multiprocessing child processes (often left by uvicorn or sync scripts)
+kill_pattern "multiprocessing.spawn" "Multiprocessing child processes"
+kill_pattern "multiprocessing.resource_tracker" "Multiprocessing resource tracker"
+
+# Kill any process running from the project's virtual environment
+kill_pattern "backend/venv/bin/python" "Virtual environment processes"
+
+# General cleanup for any orphaned python main.py or sync scripts
+kill_pattern "python.*main.py" "Orphaned main.py processes"
+kill_pattern "python.*sync_all.py" "Sync scripts"
+kill_pattern "python.*ingest_bloxtax.py" "Bloxtax ingestion scripts"
+kill_pattern "python.*recalculate_taxes.py" "Tax recalculation scripts"
 
 # Port-based cleanup as a final fallback
 for port in 8000 3000; do

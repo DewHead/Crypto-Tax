@@ -3,7 +3,7 @@ from sqlalchemy import select, delete, func
 from app.models.transaction import Transaction
 from app.models.exchange_key import ExchangeKey
 from app.models.daily_valuation import DailyValuation
-from app.services.tax_engine import get_jerusalem_date
+from app.services.tax_engine import get_jerusalem_date, is_fiat
 from app.services.boi import boi_service
 from app.services.price import price_service
 from datetime import date, timedelta
@@ -40,24 +40,49 @@ class ValuationService:
         if not all_txs:
             return
 
-        # 3. Build a daily event map
+        # 3. Build a daily event map and identify all assets/dates needed
         txs_by_date: Dict[date, List[Transaction]] = {}
+        all_asset_date_pairs = []
+        unique_dates = set()
+
         for tx in all_txs:
             d = get_jerusalem_date(tx.timestamp)
             txs_by_date.setdefault(d, []).append(tx)
+            unique_dates.add(d)
 
         all_sorted_dates = sorted(txs_by_date.keys())
         first_date = all_sorted_dates[0]
         end_date = date.today()
+        
+        # Fill in missing dates for valuation
+        curr_fill = first_date
+        while curr_fill <= end_date:
+            unique_dates.add(curr_fill)
+            curr_fill += timedelta(days=1)
+        
+        all_valuation_dates = sorted(list(unique_dates))
 
-        # 4. Clear existing valuations to avoid partial updates
+        # Identify assets to price per date (roughly)
+        # This is hard because inventory changes daily, but we can prefetch common ones
+        active_assets = set()
+        for tx in all_txs:
+            if tx.asset_from: active_assets.add(tx.asset_from)
+            if tx.asset_to: active_assets.add(tx.asset_to)
+            if tx.fee_asset: active_assets.add(tx.fee_asset)
+
+        # Prefetch BOI rates for the whole range
+        await boi_service.prefetch_rates(first_date, end_date, db=db)
+
+        # 4. Clear existing valuations
         await db.execute(delete(DailyValuation))
         
         # 5. Daily Loop
         inventory_by_exchange: Dict[str, Dict[str, float]] = {}
-        curr = first_date
+        curr_idx = 0
         
-        while curr <= end_date:
+        new_valuations = []
+
+        for curr in all_valuation_dates:
             # Update inventory with today's transactions
             if curr in txs_by_date:
                 for tx in txs_by_date[curr]:
@@ -82,29 +107,36 @@ class ValuationService:
                     
                     daily_val_ils = 0.0
                     for asset, qty in assets_to_price.items():
-                        if asset not in ['USD', 'ILS']:
-                            usd_price = await price_service.get_historical_price(asset, curr)
+                        if not is_fiat(asset):
+                            usd_price = await price_service.get_historical_price(asset, curr, db=db)
                             if usd_price:
                                 daily_val_ils += qty * usd_price * usd_ils_rate
-                        elif asset == 'USD':
+                        elif asset.upper() == 'USD':
                             daily_val_ils += qty * usd_ils_rate
-                        elif asset == 'ILS':
+                        elif asset.upper() == 'ILS':
                             daily_val_ils += qty
+                        else:
+                            usd_price = await price_service.get_historical_price(asset, curr, db=db)
+                            if usd_price:
+                                daily_val_ils += qty * usd_price * usd_ils_rate
                     
                     if daily_val_ils > 0:
-                        db.add(DailyValuation(
-                            date=curr,
-                            exchange=ex,
-                            ils_value=daily_val_ils
-                        ))
+                        new_valuations.append({
+                            'date': curr,
+                            'exchange': ex,
+                            'ils_value': daily_val_ils
+                        })
             
-            # Commit in chunks to avoid massive memory usage
-            if curr.day == 1:
+            # Commit in chunks to avoid massive memory usage and blockages
+            if len(new_valuations) >= 500:
+                await db.execute(insert(DailyValuation).values(new_valuations))
                 await db.commit()
-                
-            curr += timedelta(days=1)
+                new_valuations.clear()
         
-        await db.commit()
+        if new_valuations:
+            await db.execute(insert(DailyValuation).values(new_valuations))
+            await db.commit()
+            
         logger.info("Daily valuation update completed.")
 
 valuation_service = ValuationService()

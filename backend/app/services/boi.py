@@ -45,12 +45,18 @@ class BOIService:
         if not rates:
             return
         
-        # Always use a dedicated session for background rate updates
-        # to avoid committing or rolling back the caller's session.
-        async with AsyncSessionLocal() as db_session:
-            await self._save_to_db_internal(rates, db_session)
+        if db:
+            # If a session is provided, use it. We don't commit here to avoid
+            # potentially committing a large transaction of the caller (like tax calculation).
+            # The rates are in the memory cache, so they are available immediately.
+            # They will be persisted when the caller commits.
+            await self._save_to_db_internal(rates, db, commit=False)
+        else:
+            # Only use a dedicated session if none was provided.
+            async with AsyncSessionLocal() as db_session:
+                await self._save_to_db_internal(rates, db_session, commit=True)
 
-    async def _save_to_db_internal(self, rates: Dict[date, float], db: AsyncSession):
+    async def _save_to_db_internal(self, rates: Dict[date, float], db: AsyncSession, commit: bool = True):
         try:
             # Filter out rates that already exist in DB to avoid primary key conflicts
             existing_dates_stmt = select(ILSRate.date).where(ILSRate.date.in_(list(rates.keys())))
@@ -64,11 +70,17 @@ class BOIService:
             ]
             
             if new_rates:
-                await db.execute(insert(ILSRate).values(new_rates))
-                await db.commit()
+                # Chunk large inserts to avoid SQLite lock issues
+                for i in range(0, len(new_rates), 100):
+                    chunk = new_rates[i:i + 100]
+                    await db.execute(insert(ILSRate).values(chunk))
+                
+                if commit:
+                    await db.commit()
         except Exception as e:
             logger.error(f"Error saving rates to DB: {e}")
-            await db.rollback()
+            if commit:
+                await db.rollback()
 
     async def prefetch_rates(self, start_date: date, end_date: date, db: Optional[AsyncSession] = None):
         """

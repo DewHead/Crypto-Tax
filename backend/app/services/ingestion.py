@@ -2,9 +2,11 @@ import ccxt.async_support as ccxt
 from app.core.config import settings
 from app.models.transaction import Transaction, TransactionType
 from app.models.exchange_key import ExchangeKey
+from app.models.app_setting import AppSetting
 from app.db.session import AsyncSessionLocal
+from app.services.tax_engine import is_fiat
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, insert
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional
 import asyncio
@@ -21,15 +23,33 @@ class IngestionService:
                 'kraken': (settings.KRAKEN_API_KEY, settings.KRAKEN_API_SECRET),
                 'krakenfutures': (settings.KRAKENFUTURES_API_KEY, settings.KRAKENFUTURES_API_SECRET),
             }
+            
+            seeded = False
             for name, (key, secret) in exchanges.items():
                 if key and not key.startswith("your_") and secret and not secret.startswith("your_"):
+                    # Check if this exchange was specifically wiped by the user
+                    stmt = select(AppSetting).filter(AppSetting.key == f"wiped_{name}")
+                    wiped_setting = (await db.execute(stmt)).scalars().first()
+                    if wiped_setting and wiped_setting.value == "true":
+                        continue
+
+                    # Check if key already exists in DB
                     stmt = select(ExchangeKey).filter(ExchangeKey.exchange_name == name)
                     result = await db.execute(stmt)
                     if not result.scalars().first():
                         print(f"Seeding {name} API key from environment...")
                         new_key = ExchangeKey(exchange_name=name, api_key=key, api_secret=secret)
                         db.add(new_key)
-            await db.commit()
+                        seeded = True
+            
+            # Check if we need to mark general seeding as complete
+            stmt = select(AppSetting).filter(AppSetting.key == "env_keys_seeded")
+            if not (await db.execute(stmt)).scalars().first():
+                db.add(AppSetting(key="env_keys_seeded", value="true"))
+                seeded = True
+
+            if seeded:
+                await db.commit()
 
     async def reset_sync_status(self):
         """
@@ -42,6 +62,19 @@ class IngestionService:
                 key.is_syncing = 0
             await db.commit()
             print("Reset all sync statuses.")
+
+    async def _is_key_alive(self, key_id: int, db: Optional[AsyncSession] = None) -> bool:
+        """
+        Checks if the exchange key still exists in the database.
+        Used to stop ongoing sync tasks for deleted keys.
+        """
+        if db:
+            result = await db.execute(select(ExchangeKey).filter(ExchangeKey.id == key_id))
+            return result.scalars().first() is not None
+        
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(select(ExchangeKey).filter(ExchangeKey.id == key_id))
+            return result.scalars().first() is not None
 
     async def sync_all(self):
         async with self._sync_lock:
@@ -91,7 +124,7 @@ class IngestionService:
                     'secret': key.api_secret,
                     'enableRateLimit': True,
                 })
-                await self.sync_exchange(key.exchange_name, exchange_instance, db=db)
+                await self.sync_exchange(key.exchange_name, exchange_instance, key_id, db=db)
                 await exchange_instance.close()
             except Exception as e:
                 print(f"Error syncing {key.exchange_name}: {e}")
@@ -104,7 +137,7 @@ class IngestionService:
                         key.last_sync_at = datetime.now(timezone.utc)
                         await db_final.commit()
 
-    async def sync_exchange(self, name: str, exchange: ccxt.Exchange, db: Optional[AsyncSession] = None):
+    async def sync_exchange(self, name: str, exchange: ccxt.Exchange, key_id: int, db: Optional[AsyncSession] = None):
         try:
             await exchange.load_markets()
             assets = set()
@@ -113,6 +146,13 @@ class IngestionService:
             tx_buffer = []
             async def flush_buffer():
                 if tx_buffer:
+                    # Check if the key still exists before saving
+                    if not await self._is_key_alive(key_id, db=db):
+                        print(f"Aborting flush for {name} as key {key_id} was deleted.")
+                        tx_buffer.clear()
+                        # Raise an exception to abort the entire sync for this exchange
+                        raise Exception(f"Key {key_id} deleted during sync")
+
                     if db:
                         for tx in tx_buffer:
                             await self._save_to_db(tx, db, commit=False)
@@ -167,7 +207,7 @@ class IngestionService:
             if name.lower() == 'binance':
                 # Binance special history methods also need to be updated to use a buffer or similar
                 # For now, let's pass a custom callback to them or just let them use the buffer
-                found_assets = await self._sync_binance_special(exchange, assets, db=db, tx_buffer=tx_buffer)
+                found_assets = await self._sync_binance_special(exchange, key_id, assets, db=db, tx_buffer=tx_buffer)
                 assets.update(found_assets)
                 await flush_buffer()
 
@@ -184,7 +224,7 @@ class IngestionService:
                     since = int(datetime(2017, 1, 1).timestamp() * 1000)
                     if name.lower().startswith('kraken'):
                         print(f"Fetching all trades for {name} with pagination...")
-                        trades = await self._fetch_all_my_trades(exchange, symbol=None, since=since)
+                        trades = await self._fetch_all_my_trades(exchange, key_id, symbol=None, since=since)
                         print(f"Found {len(trades)} total trades for {name}")
                         for t in trades:
                             tx = await self._process_trade_to_tx(name, exchange, t)
@@ -194,9 +234,9 @@ class IngestionService:
                         await flush_buffer()
                         print(f"Syncing ledger for {name}...")
                         if name.lower() == 'krakenfutures':
-                            await self._sync_krakenfutures_ledger(exchange, since=since, db=db, tx_buffer=tx_buffer)
+                            await self._sync_krakenfutures_ledger(exchange, key_id, since=since, db=db, tx_buffer=tx_buffer)
                         else:
-                            await self._sync_kraken_ledger(exchange, name=name, since=since, db=db, tx_buffer=tx_buffer)
+                            await self._sync_kraken_ledger(exchange, key_id, name=name, since=since, db=db, tx_buffer=tx_buffer)
                         await flush_buffer()
                     else:
                         # Narrow symbol search but ensure common quotes are included
@@ -210,7 +250,7 @@ class IngestionService:
                         
                         print(f"Checking {len(symbols_to_check)} relevant symbols for trades on {name}...")
                         for s in symbols_to_check:
-                            trades = await self._fetch_all_my_trades(exchange, s, since=since)
+                            trades = await self._fetch_all_my_trades(exchange, key_id, s, since=since)
                             for t in trades:
                                 tx = await self._process_trade_to_tx(name, exchange, t)
                                 if tx: tx_buffer.append(tx)
@@ -223,11 +263,12 @@ class IngestionService:
         except Exception as e:
             print(f"Critical error syncing {name}: {e}")
 
-    async def _fetch_all_my_trades(self, exchange: ccxt.Exchange, symbol: str = None, since: int = None):
+    async def _fetch_all_my_trades(self, exchange: ccxt.Exchange, key_id: int, symbol: str = None, since: int = None):
         all_trades = []
         if exchange.id == 'kraken':
             offset = 0
             while True:
+                if not await self._is_key_alive(key_id): return []
                 trades = await exchange.fetch_my_trades(symbol, since=since, params={'ofs': offset})
                 if not trades: break
                 all_trades.extend(trades)
@@ -236,6 +277,7 @@ class IngestionService:
         else:
             current_since = since
             while True:
+                if not await self._is_key_alive(key_id): return []
                 trades = await exchange.fetch_my_trades(symbol, since=current_since)
                 if not trades: break
                 all_trades.extend(trades)
@@ -245,12 +287,13 @@ class IngestionService:
                 if len(trades) < 5: break
         return all_trades
 
-    async def _sync_kraken_ledger(self, exchange: ccxt.Exchange, name: str = 'kraken', since: int = None, db: Optional[AsyncSession] = None, tx_buffer: List[Transaction] = None):
+    async def _sync_kraken_ledger(self, exchange: ccxt.Exchange, key_id: int, name: str = 'kraken', since: int = None, db: Optional[AsyncSession] = None, tx_buffer: List[Transaction] = None):
         try:
             print(f"Syncing {name} ledger since {since}...")
             all_ledger = []
             offset = 0
             while True:
+                if not await self._is_key_alive(key_id): return
                 ledger = await exchange.fetch_ledger(since=since, params={'ofs': offset})
                 if not ledger: break
                 all_ledger.extend(ledger)
@@ -317,12 +360,12 @@ class IngestionService:
                         tx = Transaction(
                             exchange=name, tx_hash=refid,
                             timestamp=datetime.fromtimestamp(in_entry['timestamp'] / 1000.0),
-                            type=TransactionType.sell if out_entry['currency'] not in ['USD', 'EUR', 'ILS'] else TransactionType.buy,
+                            type=TransactionType.sell if not is_fiat(out_entry['currency']) else TransactionType.buy,
                             asset_from=out_entry['currency'], amount_from=abs(out_entry['amount']),
                             asset_to=in_entry['currency'], amount_to=abs(in_entry['amount']),
                             fee_asset=in_entry['fee']['currency'] if in_entry.get('fee') else None,
                             fee_amount=in_entry['fee']['cost'] if in_entry.get('fee') else 0.0,
-                            is_taxable_event=1 if out_entry['currency'] not in ['USD', 'EUR', 'ILS'] else 0,
+                            is_taxable_event=1 if not is_fiat(out_entry['currency']) else 0,
                             source='api'
                         )
                         if tx_buffer is not None: tx_buffer.append(tx)
@@ -330,13 +373,14 @@ class IngestionService:
         except Exception as e:
             print(f"Error syncing {name} ledger: {e}")
 
-    async def _sync_krakenfutures_ledger(self, exchange: ccxt.Exchange, since: int = None, db: Optional[AsyncSession] = None, tx_buffer: List[Transaction] = None):
+    async def _sync_krakenfutures_ledger(self, exchange: ccxt.Exchange, key_id: int, since: int = None, db: Optional[AsyncSession] = None, tx_buffer: List[Transaction] = None):
         try:
             print(f"Syncing krakenfutures ledger...")
             res = await exchange.history_get_account_log()
             logs = res.get('logs', [])
             
             for l in logs:
+                if not await self._is_key_alive(key_id): return
                 date_str = l['date']
                 try:
                     if '.' in date_str:
@@ -427,7 +471,7 @@ class IngestionService:
                 )
         except: return None
 
-    async def _sync_binance_special(self, exchange: ccxt.Exchange, assets: set, db: Optional[AsyncSession] = None, tx_buffer: List[Transaction] = None):
+    async def _sync_binance_special(self, exchange: ccxt.Exchange, key_id: int, assets: set, db: Optional[AsyncSession] = None, tx_buffer: List[Transaction] = None):
         discovered_assets = set()
         end_time = int(datetime.now().timestamp() * 1000)
         chunk_ms = 30 * 24 * 60 * 60 * 1000
@@ -441,6 +485,7 @@ class IngestionService:
         try:
             current_end = end_time
             while current_end > wall_time:
+                if not await self._is_key_alive(key_id): return discovered_assets
                 current_start = max(current_end - chunk_ms, wall_time)
                 response = await exchange.sapi_get_convert_tradeflow({'startTime': current_start, 'endTime': current_end, 'limit': 1000})
                 records = response.get('list', [])
@@ -461,6 +506,7 @@ class IngestionService:
         try:
             current_end = end_time
             while current_end > wall_time:
+                if not await self._is_key_alive(key_id): return discovered_assets
                 current_start = max(current_end - chunk_ms, wall_time)
                 response = await exchange.sapi_get_asset_dribblet({'startTime': current_start, 'endTime': current_end})
                 userAssetDribblets = response.get('userAssetDribblets', [])
@@ -483,6 +529,7 @@ class IngestionService:
         try:
             current_end = end_time
             while current_end > wall_time:
+                if not await self._is_key_alive(key_id): return discovered_assets
                 current_start = max(current_end - chunk_ms, wall_time)
                 for earn_type in ['Flexible', 'Locked']:
                     page = 1

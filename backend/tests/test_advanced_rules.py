@@ -59,6 +59,7 @@ async def test_wash_sale_forward_rule(tax_engine, db):
 
     with patch('app.services.boi.boi_service.get_usd_ils_rate', return_value=3.5), \
          patch('app.services.boi.boi_service.prefetch_rates', AsyncMock()), \
+         patch('app.services.price.price_service.prefetch_prices', AsyncMock()), \
          patch('app.services.cpi.cpi_service.get_cpi_index', return_value=100.0), \
          patch('app.services.price.price_service.get_historical_price', side_effect=[50000.0, 40000.0, 42000.0, 50000.0]):
         
@@ -78,6 +79,7 @@ async def test_wash_sale_forward_rule(tax_engine, db):
     
     with patch('app.services.boi.boi_service.get_usd_ils_rate', return_value=3.5), \
          patch('app.services.boi.boi_service.prefetch_rates', AsyncMock()), \
+         patch('app.services.price.price_service.prefetch_prices', AsyncMock()), \
          patch('app.services.cpi.cpi_service.get_cpi_index', return_value=100.0), \
          patch('app.services.price.price_service.get_historical_price', side_effect=[50000.0, 40000.0, 42000.0, 50000.0]):
         await tax_engine.calculate_taxes(db, use_wash_sale_rule=True)
@@ -119,6 +121,7 @@ async def test_cpi_madad_adjustment(tax_engine, db):
 
     with patch('app.services.boi.boi_service.get_usd_ils_rate', return_value=1.0), \
          patch('app.services.boi.boi_service.prefetch_rates', AsyncMock()), \
+         patch('app.services.price.price_service.prefetch_prices', AsyncMock()), \
          patch('app.services.cpi.cpi_service.get_cpi_index', side_effect=mock_cpi):
         
         await tax_engine.calculate_taxes(db)

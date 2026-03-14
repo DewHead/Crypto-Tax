@@ -5,6 +5,7 @@ from app.services.tax_engine import TaxEngine
 from app.models.transaction import Transaction, TransactionType
 from app.db.session import Base
 from datetime import datetime
+from unittest.mock import AsyncMock, patch
 
 # Use a test database
 TEST_DB_URL = "sqlite+aiosqlite:///./test_ledger.db"
@@ -58,17 +59,18 @@ async def test_fifo_simple_buy_sell(db):
     db.add(sell_tx)
     await db.commit()
     
-    await TaxEngine().calculate_taxes(db)
+    with patch('app.services.boi.boi_service.prefetch_rates', AsyncMock()), \
+         patch('app.services.price.price_service.prefetch_prices', AsyncMock()), \
+         patch('app.services.boi.boi_service.get_usd_ils_rate', return_value=3.5), \
+         patch('app.services.price.price_service.get_historical_price', side_effect=[50000.0, 60000.0]):
+        await TaxEngine().calculate_taxes(db)
     
     # Check results
     from sqlalchemy import select
     stmt = select(Transaction).filter(Transaction.tx_hash == '0x2')
     result = await db.execute(stmt)
     updated_sell = result.scalars().first()
-    # Cost basis for 0.5 BTC should be 5000 USD * ILS rate
-    # Let's check capital gain
-    # Proceeds = 7000 * rate, Cost = 5000 * rate
-    # Gain should be 2000 * rate
+    
     assert updated_sell.capital_gain_ils > 0
     assert updated_sell.cost_basis_ils > 0
 
@@ -103,7 +105,10 @@ async def test_transfer_reconciliation(db):
     db.add(d_tx)
     await db.commit()
     
-    await TaxEngine().calculate_taxes(db)
+    with patch('app.services.boi.boi_service.prefetch_rates', AsyncMock()), \
+         patch('app.services.price.price_service.prefetch_prices', AsyncMock()), \
+         patch('app.services.boi.boi_service.get_usd_ils_rate', return_value=3.5):
+        await TaxEngine().calculate_taxes(db)
     
     # Check that it's NOT a taxable event
     from sqlalchemy import select

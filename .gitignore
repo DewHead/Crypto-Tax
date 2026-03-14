@@ -3,6 +3,7 @@ node_modules
 dist
 .env
 .env.local
+.env.*
 backend/venv
 __pycache__
 *.pyc
@@ -16,3 +17,15 @@ bloxtax_*
 .DS_Store
 frontend/test-results
 frontend/playwright-report
+*.log
+.agent/
+.agents/
+.claude/
+.crush/
+.factory/
+.gemini/
+.goose/
+.mux/
+.pi/
+.zencoder/
+.ruff_cache/

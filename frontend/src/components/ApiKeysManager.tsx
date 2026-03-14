@@ -36,7 +36,7 @@ export default function ApiKeysManager() {
   };
 
   const handleDelete = async (id: number, name: string) => {
-    if (!window.confirm(`Are you sure you want to delete ${displayExchangeName(name)}? This will PERMANENTLY delete ALL transaction data (API and CSV) for this wallet and recalculate your taxes.`)) {
+    if (!window.confirm(`Are you sure you want to delete the API connection for ${displayExchangeName(name)}? This will remove all transactions imported via API, but your manual CSV imports will be PRESERVED.`)) {
       return;
     }
     
@@ -46,28 +46,41 @@ export default function ApiKeysManager() {
       queryClient.invalidateQueries({ queryKey: ['data-sources'] });
       queryClient.invalidateQueries({ queryKey: ['ledger'] });
       queryClient.invalidateQueries({ queryKey: ['kpi'] });
-      toast.success(`${displayExchangeName(name)} and all associated data deleted`);
+      toast.success(`API connection for ${displayExchangeName(name)} removed. CSV data preserved.`);
     } catch (e) {
       console.error("Failed to delete key", e);
-      toast.error('Failed to delete API key');
+      toast.error('Failed to remove API connection');
     }
   };
 
   const handleDeleteDataSource = async (name: string) => {
-    if (!window.confirm(`Are you sure you want to delete ALL data for ${displayExchangeName(name)}? This includes both API and CSV transactions and will recalculate your taxes.`)) {
-      return;
+    const choice = window.confirm(`How do you want to wipe data for ${displayExchangeName(name)}?\n\n- Click OK to wipe ALL records (API + Manual CSV).\n- Click Cancel to wipe ONLY API records and preserve manual CSVs.`);
+    
+    // We'll use a more specialized confirmation for full wipe if they clicked OK
+    let wipeCsv = false;
+    if (choice) {
+       if (window.confirm(`WARNING: This will permanently delete ALL manual CSV records for ${displayExchangeName(name)}. Are you absolutely sure?`)) {
+         wipeCsv = true;
+       } else {
+         return; // User backed out of full wipe
+       }
+    } else {
+       if (!window.confirm(`This will wipe all API-sourced data for ${displayExchangeName(name)}. Manual CSV data will be preserved. Proceed?`)) {
+         return;
+       }
+       wipeCsv = false;
     }
     
     try {
-      await deleteDataSource(name);
+      await deleteDataSource(name, wipeCsv);
       queryClient.invalidateQueries({ queryKey: ['keys'] });
       queryClient.invalidateQueries({ queryKey: ['data-sources'] });
       queryClient.invalidateQueries({ queryKey: ['ledger'] });
       queryClient.invalidateQueries({ queryKey: ['kpi'] });
-      toast.success(`All data for ${displayExchangeName(name)} has been deleted`);
+      toast.success(`${wipeCsv ? 'All' : 'API'} data for ${displayExchangeName(name)} cleared.`);
     } catch (e) {
       console.error("Failed to delete data source", e);
-      toast.error('Failed to delete data source');
+      toast.error('Failed to clear data');
     }
   };
 

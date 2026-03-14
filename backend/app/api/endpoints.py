@@ -237,17 +237,24 @@ async def get_exchange_keys(db: AsyncSession = Depends(get_db)):
 
 @router.post("/keys", response_model=ExchangeKeyResponse)
 async def create_exchange_key(key_data: ExchangeKeyCreate, db: AsyncSession = Depends(get_db)):
+    exchange_name = key_data.exchange_name.lower()
     if not key_data.api_key:
         stmt = select(ExchangeKeyModel).filter(
-            ExchangeKeyModel.exchange_name == key_data.exchange_name.lower(),
+            ExchangeKeyModel.exchange_name == exchange_name,
             ExchangeKeyModel.api_key == None
         )
         existing = (await db.execute(stmt)).scalars().first()
         if existing:
             return existing
 
+    # If manually adding a key, clear the "wiped" flag
+    stmt = select(AppSettingModel).filter(AppSettingModel.key == f"wiped_{exchange_name}")
+    setting = (await db.execute(stmt)).scalars().first()
+    if setting:
+        setting.value = "false"
+
     new_key = ExchangeKeyModel(
-        exchange_name=key_data.exchange_name.lower(),
+        exchange_name=exchange_name,
         api_key=key_data.api_key,
         api_secret=key_data.api_secret
     )
@@ -288,13 +295,41 @@ async def get_data_sources(db: AsyncSession = Depends(get_db)):
     return [{"exchange": k, **v} for k, v in stats.items()]
 
 @router.delete("/data-sources/{exchange_name}")
-async def delete_data_source(exchange_name: str, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+async def delete_data_source(exchange_name: str, background_tasks: BackgroundTasks, wipe_csv: bool = Query(False), db: AsyncSession = Depends(get_db)):
     from sqlalchemy import delete
-    await db.execute(delete(TransactionModel).filter(TransactionModel.exchange == exchange_name))
+    # Delete transactions for this exchange
+    if wipe_csv:
+        # Full wipe (API + CSV)
+        await db.execute(delete(TransactionModel).filter(
+            TransactionModel.exchange == exchange_name
+        ))
+    else:
+        # Only delete API-sourced transactions, preserve CSV
+        await db.execute(delete(TransactionModel).filter(
+            TransactionModel.exchange == exchange_name,
+            TransactionModel.source == 'api'
+        ))
+    
+    # Always delete API keys for this exchange
     await db.execute(delete(ExchangeKeyModel).filter(ExchangeKeyModel.exchange_name == exchange_name))
+    
+    # Mark as wiped to prevent re-seeding from .env on restart
+    from app.models.app_setting import AppSetting as AppSettingModel
+    stmt = select(AppSettingModel).filter(AppSettingModel.key == f"wiped_{exchange_name}")
+    setting = (await db.execute(stmt)).scalars().first()
+    if setting:
+        setting.value = "true"
+    else:
+        db.add(AppSettingModel(key=f"wiped_{exchange_name}", value="true"))
+
     await db.commit()
     background_tasks.add_task(run_sync_and_calculate_background)
-    return {"status": "deleted"}
+    
+    return {
+        "status": "deleted", 
+        "scope": "all" if wipe_csv else "api_only",
+        "exchange": exchange_name
+    }
 
 @router.delete("/keys/{key_id}")
 async def delete_exchange_key(key_id: int, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
@@ -302,15 +337,27 @@ async def delete_exchange_key(key_id: int, background_tasks: BackgroundTasks, db
     key = result.scalars().first()
     if not key:
         raise HTTPException(status_code=404, detail="Key not found")
-    
+
     exchange_name = key.exchange_name
     from sqlalchemy import delete
-    await db.execute(delete(TransactionModel).filter(TransactionModel.exchange == exchange_name))
+    # Only delete API-sourced transactions for this exchange, preserve CSV
+    await db.execute(delete(TransactionModel).filter(
+        TransactionModel.exchange == exchange_name,
+        TransactionModel.source == 'api'
+    ))
     await db.execute(delete(ExchangeKeyModel).filter(ExchangeKeyModel.id == key_id))
+
+    # Mark as wiped to prevent re-seeding from .env on restart
+    stmt = select(AppSettingModel).filter(AppSettingModel.key == f"wiped_{exchange_name}")
+    setting = (await db.execute(stmt)).scalars().first()
+    if setting:
+        setting.value = "true"
+    else:
+        db.add(AppSettingModel(key=f"wiped_{exchange_name}", value="true"))
+
     await db.commit()
     background_tasks.add_task(run_sync_and_calculate_background)
-    return {"status": "deleted"}
-
+    return {"status": "deleted_api_key_and_api_data"}
 @router.post("/test-email")
 async def send_test_email(db: AsyncSession = Depends(get_db)):
     email = await get_notification_email(db)

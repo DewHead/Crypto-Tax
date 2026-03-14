@@ -5,6 +5,7 @@ from sqlalchemy import pool
 
 from alembic import context
 from app.db.session import Base
+from app.models.historical_price import HistoricalPrice
 from app.models.transaction import Transaction
 from app.models.exchange_key import ExchangeKey
 from app.models.ils_rate import ILSRate

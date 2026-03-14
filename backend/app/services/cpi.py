@@ -104,43 +104,68 @@ class CPIService:
 
     async def get_cpi_index(self, target_date: date, db: Optional[AsyncSession] = None) -> float:
         """
-        Returns the CPI index value for a given date.
-        Uses the index value of the month containing the date.
-        If not yet published, uses the most recent available.
+        Returns the "Known CPI" (Madad Yadu'a) index value for a given date.
+        According to Israeli tax law, the CPI is published on the 15th for the previous month.
+        If target_date < 15, known CPI is from 2 months ago.
+        If target_date >= 15, known CPI is from 1 month ago.
         """
         if target_date > date.today():
             target_date = date.today()
 
+        known_cpi_month_start = self.get_known_cpi_date(target_date)
+
         # Check cache
-        month_start = target_date.replace(day=1)
-        if month_start in self.cache:
-            return self.cache[month_start]
+        if known_cpi_month_start in self.cache:
+            return self.cache[known_cpi_month_start]
 
         # Check DB
         if db:
-            stmt = select(CPIRate).where(CPIRate.date <= target_date).order_by(desc(CPIRate.date)).limit(1)
+            stmt = select(CPIRate).where(CPIRate.date == known_cpi_month_start).limit(1)
             result = await db.execute(stmt)
             row = result.scalars().first()
-            if row and row.date.year == target_date.year and row.date.month == target_date.month:
+            if row:
                 self.cache[row.date] = row.index_value
                 return row.index_value
         
         # Fetch if needed
-        start_date = target_date - timedelta(days=365) # Fetch a year's worth
-        await self.prefetch_rates(start_date, target_date, db=db)
+        # Ensure we have a reasonable range
+        start_date = known_cpi_month_start - timedelta(days=365)
+        await self.prefetch_rates(start_date, known_cpi_month_start, db=db)
 
         # Look for the exact month first
-        if month_start in self.cache:
-            return self.cache[month_start]
+        if known_cpi_month_start in self.cache:
+            return self.cache[known_cpi_month_start]
         
-        # Fallback to the most recent one before target_date
-        past_dates = [d for d in self.cache.keys() if d <= target_date]
+        # Fallback to the most recent one before or on known_cpi_month_start
+        past_dates = [d for d in self.cache.keys() if d <= known_cpi_month_start]
         if past_dates:
             most_recent = max(past_dates)
             return self.cache[most_recent]
 
         # Ultimate fallback (Base 100 or something reasonable)
         return 100.0
+
+    def get_known_cpi_date(self, transaction_date: date) -> date:
+        """
+        Determines the month for which the CPI is 'known' on a given transaction date.
+        Israeli law: CPI is published on the 15th of month M for month M-1.
+        """
+        # If the transaction is before the 15th, the known CPI is from 2 months ago
+        if transaction_date.day < 15:
+            # e.g., May 10 -> Month 3 (March)
+            month_offset = 2
+        else:
+            # If the transaction is on or after the 15th, the known CPI is from 1 month ago
+            # e.g., May 16 -> Month 4 (April)
+            month_offset = 1
+            
+        known_month = transaction_date.month - month_offset
+        known_year = transaction_date.year
+        if known_month <= 0:
+            known_month += 12
+            known_year -= 1
+            
+        return date(known_year, known_month, 1)
 
     def _parse_csv_to_cache(self, csv_text: str) -> Dict[date, float]:
         f = io.StringIO(csv_text)

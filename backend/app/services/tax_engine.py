@@ -14,6 +14,13 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+FIAT_ASSETS = {'USD', 'ILS', 'EUR', 'GBP', 'JPY'}
+
+def is_fiat(asset: Optional[str]) -> bool:
+    if not asset:
+        return False
+    return asset.upper() in FIAT_ASSETS
+
 def get_jerusalem_date(ts: datetime) -> date:
     """Localize UTC timestamp to Asia/Jerusalem before extracting the date."""
     if ts.tzinfo is None:
@@ -181,7 +188,8 @@ class TaxLedger:
         remaining_qty = amount
         
         if asset in self.inventory:
-            # We look for lots in inventory acquired < 30 days before this sell
+            # ONLY check lots that are still in the active inventory queue!
+            # (Matches the user advice to avoid "Ghost Losses" in already consumed lots)
             for lot in reversed(self.inventory[asset]):
                 if remaining_qty <= 0 or remaining_loss <= 0:
                     break
@@ -191,7 +199,8 @@ class TaxLedger:
                     lot_ts = lot_ts.replace(tzinfo=timezone.utc)
 
                 time_diff = (tx_ts - lot_ts).total_seconds()
-                if 0 < time_diff <= 30 * 86400: # Bought within 30 days before sale
+                # If bought within 30 days before sale (including same timestamp)
+                if 0 <= time_diff <= 30 * 86400: 
                     # This lot absorbs the loss
                     absorb_qty = min(remaining_qty, lot['amount'])
                     absorb_proportion = absorb_qty / amount
@@ -237,9 +246,11 @@ class TaxEngine:
         active_txs = [t for t in all_txs if t.is_active]
 
         # Phase 2: Valuation (Pricing everything to ILS)
+        logger.info(f"--- Phase 2: Valuation ({len(active_txs)} active transactions) ---")
         await self._run_valuation(active_txs, db)
         
         # Phase 3: The FIFO Ledger
+        logger.info(f"--- Phase 3: FIFO Ledger Calculation ({len(active_txs)} transactions) ---")
         ledger = TaxLedger(db)
         for tx in active_txs:
             await self._process_transaction(tx, ledger, reconciled_ids, db, use_wash_sale_rule=use_wash_sale_rule)
@@ -335,7 +346,8 @@ class TaxEngine:
 
                     if d.id not in reconciled_ids:
                         d_amt = d.amount_to or 0.0
-                        if d_amt <= w_amt and d_amt >= (w_amt * 0.95):
+                        # Allow slightly larger deposit (airdrops/rebases) up to 5%
+                        if d_amt >= (w_amt * 0.95) and d_amt <= (w_amt * 1.05):
                             w.is_taxable_event = 0
                             d.is_taxable_event = 0
                             w.linked_transaction_id = d.id
@@ -345,7 +357,7 @@ class TaxEngine:
                             reconciled_ids.update([w.id, d.id])
 
                             fee_amount = w_amt - d_amt
-                            if fee_amount > 1e-10:
+                            if fee_amount > 1e-8: # Enforce strict positive floor
                                 w.fee_amount = (w.fee_amount or 0.0) + fee_amount
                                 w.fee_asset = w.asset_from
                                 w.issue_notes = (w.issue_notes or "") + f" | Transfer fee applied: {fee_amount} {w.asset_from}"
@@ -359,8 +371,20 @@ class TaxEngine:
         max_date = get_jerusalem_date(txs[-1].timestamp)
         await boi_service.prefetch_rates(min_date, max_date, db=db)
 
-        rate_cache: Dict[date, float] = {}
+        # Prefetch crypto prices
+        price_tasks = []
+        for tx in txs:
+            tx_date = get_jerusalem_date(tx.timestamp)
+            if tx.asset_from: price_tasks.append((tx.asset_from, tx_date))
+            if tx.asset_to: price_tasks.append((tx.asset_to, tx_date))
+            if tx.fee_asset: price_tasks.append((tx.fee_asset, tx_date))
+        
+        if price_tasks:
+            logger.info(f"⚡ Prefetching {len(price_tasks)} crypto prices in parallel...")
+            await price_service.prefetch_prices(price_tasks, db=db)
+            logger.info(f"✅ Crypto price prefetching complete.")
 
+        rate_cache: Dict[date, float] = {}
         for tx in txs:
             rate_date = get_jerusalem_date(tx.timestamp)
             if rate_date not in rate_cache:
@@ -368,18 +392,19 @@ class TaxEngine:
 
             tx.ils_exchange_rate = rate_cache[rate_date]
             tx.ils_rate_date = rate_date
-    async def get_ils_value(self, asset: str, amount: float, tx_date: date, usd_ils_rate: float) -> float:
+
+    async def get_ils_value(self, asset: str, amount: float, tx_date: date, usd_ils_rate: float, db: Optional[AsyncSession] = None) -> float:
         if not asset or amount == 0:
             return 0.0
-        if asset == 'ILS':
+        if asset.upper() == 'ILS':
             return amount
             
         rate = usd_ils_rate or 3.65
         
-        if asset in ['USD', 'USDT', 'USDC', 'BUSD', 'DAI']:
+        if asset.upper() in ['USD', 'USDT', 'USDC', 'BUSD', 'DAI']:
             return amount * rate
         
-        usd_price = await price_service.get_historical_price(asset, tx_date)
+        usd_price = await price_service.get_historical_price(asset, tx_date, db=db)
         if usd_price is not None:
             val = amount * usd_price * rate
             logger.info(f"Price: {asset} on {tx_date} is ${usd_price}, ILS value: {val}")
@@ -401,7 +426,7 @@ class TaxEngine:
         tx_date = get_jerusalem_date(tx.timestamp)
 
         # 1. Handle Kraken Futures PnL (Special Case)
-        if tx.exchange == 'krakenfutures' and tx.type in [TransactionType.fee, TransactionType.earn] and (tx.asset_from in ['USD', 'BTC', 'XBT'] or tx.asset_to in ['USD', 'BTC', 'XBT']):
+        if tx.exchange == 'krakenfutures' and tx.type in [TransactionType.fee, TransactionType.earn] and (is_fiat(tx.asset_from) or tx.asset_from in ['BTC', 'XBT'] or is_fiat(tx.asset_to) or tx.asset_to in ['BTC', 'XBT']):
             tx_amt_to = tx.amount_to or 0.0
             tx_amt_from = tx.amount_from or 0.0
             pnl_amount = tx_amt_to if tx_amt_to > 0 else -tx_amt_from
@@ -415,14 +440,14 @@ class TaxEngine:
         # Pre-calculate values
         amt_from = tx.amount_from or 0.0
         amt_to = tx.amount_to or 0.0
-        val_from = await self.get_ils_value(tx.asset_from, amt_from, tx_date, rate)
-        val_to = await self.get_ils_value(tx.asset_to, amt_to, tx_date, rate)
-        fee_ils = await self.get_ils_value(tx.fee_asset, tx.fee_amount or 0.0, tx_date, rate)
+        val_from = await self.get_ils_value(tx.asset_from, amt_from, tx_date, rate, db=db)
+        val_to = await self.get_ils_value(tx.asset_to, amt_to, tx_date, rate, db=db)
+        fee_ils = await self.get_ils_value(tx.fee_asset, tx.fee_amount or 0.0, tx_date, rate, db=db)
 
         # For swaps, we use fiat value if available, otherwise FMV of acquired/disposed asset.
-        if tx.asset_from in ['USD', 'ILS']:
+        if is_fiat(tx.asset_from):
             effective_swap_value = val_from
-        elif tx.asset_to in ['USD', 'ILS']:
+        elif is_fiat(tx.asset_to):
             effective_swap_value = val_to
         else:
             effective_swap_value = val_to if val_to > 0 else val_from
@@ -441,10 +466,10 @@ class TaxEngine:
         if is_sell:
             asset = tx.asset_from
             qty = amt_from
-            is_fiat = asset in ['USD', 'ILS']
+            _is_fiat_disposal = is_fiat(asset)
 
             if tx.id not in reconciled_ids:
-                cost_basis, consumptions = await ledger.consume_lots(asset, qty, tx) if not is_fiat else (0.0, [])
+                cost_basis, consumptions = await ledger.consume_lots(asset, qty, tx) if not _is_fiat_disposal else (val_from, [])
 
                 # Valuation of proceeds: If swap, use effective_swap_value
                 proceeds = (effective_swap_value if amt_to > 0 else val_from) - fee_ils
@@ -452,7 +477,7 @@ class TaxEngine:
                 tx.cost_basis_ils = cost_basis
 
                 # ITA Rule: Stablecoins are NOT fiat.
-                if not is_fiat and tx.type != TransactionType.withdrawal:
+                if not _is_fiat_disposal and tx.type != TransactionType.withdrawal:
                     tx.is_taxable_event = 1
                     total_nominal_gain = proceeds - cost_basis
                     
@@ -482,13 +507,13 @@ class TaxEngine:
         if is_buy:
             asset = tx.asset_to
             qty = amt_to
-            is_fiat = asset in ['USD', 'ILS']
+            _is_fiat_acquisition = is_fiat(asset)
 
             # If it's a reconciled transfer or fiat, skip adding to ledger completely
             if tx.id in reconciled_ids:
                 # Don't overwrite if it was already marked taxable by disposal side
                 pass 
-            elif is_fiat:
+            elif _is_fiat_acquisition:
                 # Don't overwrite if it was already marked taxable by disposal side
                 pass
             else:
@@ -501,7 +526,11 @@ class TaxEngine:
                     # Don't overwrite taxable status
                 else:
                     # Swap or Buy
-                    cost_basis = effective_swap_value
+                    # CRITICAL FIX: If we bought with fiat, lock cost basis to exact fiat spent
+                    if is_fiat(tx.asset_from):
+                        cost_basis = val_from
+                    else:
+                        cost_basis = effective_swap_value
 
                 cost_basis += fee_ils
                 await ledger.add_lot(asset, qty, cost_basis, tx)
@@ -512,7 +541,7 @@ class TaxEngine:
 
         # 4. Handle Crypto Fee Disposals (CRITICAL ITA)
         f_amt = tx.fee_amount or 0.0
-        if f_amt > 0 and tx.fee_asset and tx.fee_asset not in ['USD', 'ILS']:
+        if f_amt > 0 and tx.fee_asset and not is_fiat(tx.fee_asset):
             fee_asset = tx.fee_asset
             fee_qty = f_amt
             fee_cost_basis, fee_consumptions = await ledger.consume_lots(fee_asset, fee_qty, tx)
@@ -525,6 +554,12 @@ class TaxEngine:
             for c in fee_consumptions:
                 c.inflationary_gain_ils = c.adjusted_cost_basis_ils - c.ils_value_consumed
                 fee_inflationary += c.inflationary_gain_ils
+
+            # Wash Sale Rule for Fees (Section 94B)
+            if use_wash_sale_rule and fee_nominal_gain < 0:
+                await ledger.record_loss(fee_asset, abs(fee_nominal_gain), fee_qty, tx)
+                fee_nominal_gain = 0.0
+                fee_inflationary = 0.0
 
             tx.inflationary_gain_ils += fee_inflationary
             tx.capital_gain_ils += fee_nominal_gain
@@ -655,12 +690,12 @@ class TaxEngine:
             amt_to = tx.amount_to or 0.0
             
             # Acquisition
-            if amt_to > 0 and tx.asset_to and tx.asset_to not in ['USD', 'ILS']:
+            if amt_to > 0 and tx.asset_to and not is_fiat(tx.asset_to):
                 cost = tx.cost_basis_ils or 0.0
                 await ledger.add_lot(tx.asset_to, amt_to, cost, tx)
             
             # Disposal
-            if amt_from > 0 and tx.asset_from and tx.asset_from not in ['USD', 'ILS']:
+            if amt_from > 0 and tx.asset_from and not is_fiat(tx.asset_from):
                 await ledger.consume_lots(tx.asset_from, amt_from, tx)
 
         # 2. Calculate unrealized PnL using current prices
