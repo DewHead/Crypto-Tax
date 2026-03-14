@@ -18,10 +18,10 @@ class TaxLedger:
         self.recent_losses: Dict[str, List[Dict[str, Any]]] = {} # asset -> list of {'timestamp', 'loss_ils', 'amount'}
 
     async def consume_lots(self, asset: str, qty: float, sell_tx: Transaction) -> float:
-        logger.info(f\"Consuming {qty} {asset} for TX {sell_tx.id} ({sell_tx.timestamp})\")
+        logger.info(f"Consuming {qty} {asset} for TX {sell_tx.id} ({sell_tx.timestamp})")
         if asset not in self.inventory or not self.inventory[asset]:
             sell_tx.is_issue = True
-            sell_tx.issue_notes = (sell_tx.issue_notes or \"\") + f\" | Missing cost basis for {round(qty, 8)} {asset}.\"
+            sell_tx.issue_notes = (sell_tx.issue_notes or "") + f" | Missing cost basis for {round(qty, 8)} {asset}."
             return 0.0
 
         total_cost_basis_ils = 0.0
@@ -57,7 +57,7 @@ class TaxLedger:
         return total_cost_basis_ils
 
     def add_lot(self, asset: str, amount: float, cost_basis_ils: float, tx: Transaction):
-        logger.info(f\"Adding lot: {amount} {asset} at {cost_basis_ils} ILS from TX {tx.id} ({tx.timestamp})\")
+        logger.info(f"Adding lot: {amount} {asset} at {cost_basis_ils} ILS from TX {tx.id} ({tx.timestamp})")
         if asset not in self.inventory:
             self.inventory[asset] = []
         
@@ -169,7 +169,7 @@ class TaxEngine:
                     break
             
             if merged_count > 0:
-                curr.raw_data = (curr.raw_data or \"\") + f\" | Merged {merged_count + 1} trades.\"
+                curr.raw_data = (curr.raw_data or "") + f" | Merged {merged_count + 1} trades."
             i = j
 
     async def _run_transfer_reconciliation(self, txs: List[Transaction], db: AsyncSession) -> Set[int]:
@@ -194,8 +194,8 @@ class TaxEngine:
                             d.is_taxable_event = 0
                             w.linked_transaction_id = d.id
                             d.linked_transaction_id = w.id
-                            w.category = \"Transfer\"
-                            d.category = \"Transfer\"
+                            w.category = "Transfer"
+                            d.category = "Transfer"
                             
                             reconciled_ids.add(w.id)
                             reconciled_ids.add(d.id)
@@ -203,7 +203,10 @@ class TaxEngine:
                             # Log transfer fee if any
                             fee_amount = w_amt - d_amt
                             if fee_amount > 1e-10:
-                                w.issue_notes = (w.issue_notes or \"\") + f\" | Transfer fee: {fee_amount} {w.asset_from}\"
+                                # Assign the lost amount as a fee so _process_transaction taxes it
+                                w.fee_amount = (w.fee_amount or 0.0) + fee_amount
+                                w.fee_asset = w.asset_from
+                                w.issue_notes = (w.issue_notes or "") + f" | Transfer fee applied: {fee_amount} {w.asset_from}"
                             break
         return reconciled_ids
 
@@ -238,10 +241,10 @@ class TaxEngine:
         usd_price = await price_service.get_historical_price(asset, tx_date)
         if usd_price is not None:
             val = amount * usd_price * rate
-            logger.info(f\"Price: {asset} on {tx_date} is ${usd_price}, ILS value: {val}\")
+            logger.info(f"Price: {asset} on {tx_date} is ${usd_price}, ILS value: {val}")
             return val
         
-        logger.warning(f\"MISSING PRICE: {asset} on {tx_date}\")
+        logger.warning(f"MISSING PRICE: {asset} on {tx_date}")
         return 0.0
 
     async def _process_transaction(self, tx: Transaction, ledger: TaxLedger, reconciled_ids: Set[int], db: AsyncSession, use_wash_sale_rule: bool = False):
@@ -296,8 +299,8 @@ class TaxEngine:
                 # Fallback for missing cost basis: ITA default assumes ZERO
                 if cost_basis == 0 and qty > 0 and not is_fiat:
                     tx.is_issue = True
-                    tx.issue_notes = (tx.issue_notes or \"\") + \" | Missing cost basis. ITA default assumes ZERO.\"
-                    logger.warning(f\"MISSING COST BASIS: {tx.timestamp} {asset} qty={qty}. Assumed ZERO.\")
+                    tx.issue_notes = (tx.issue_notes or "") + " | Missing cost basis. ITA default assumes ZERO."
+                    logger.warning(f"MISSING COST BASIS: {tx.timestamp} {asset} qty={qty}. Assumed ZERO.")
 
                 tx.cost_basis_ils = cost_basis
 
@@ -321,25 +324,24 @@ class TaxEngine:
             asset = tx.asset_to
             qty = amt_to
 
+            # If it's a reconciled transfer, skip adding to ledger completely
             if tx.id in reconciled_ids:
-                # Transfer: Simplified fallback to market price
-                cost_basis = val_to
-            elif tx.type == TransactionType.earn:
-                cost_basis = val_to
-                tx.is_taxable_event = 1
-                tx.ordinary_income_ils = cost_basis
-                tx.cost_basis_ils = cost_basis
+                tx.is_taxable_event = 0
+                tx.cost_basis_ils = 0.0 
             else:
-                # Swap or Buy: Use effective_swap_value
-                cost_basis = effective_swap_value
+                if tx.type == TransactionType.earn:
+                    cost_basis = val_to
+                    tx.is_taxable_event = 1
+                    tx.ordinary_income_ils = cost_basis
+                else:
+                    # Swap or Buy
+                    cost_basis = effective_swap_value
 
-            # Add fee to cost basis
-            cost_basis += fee_ils
-
-            ledger.add_lot(asset, qty, cost_basis, tx)
-
-            if not is_sell and tx.type != TransactionType.deposit:
-                tx.cost_basis_ils = cost_basis
+                cost_basis += fee_ils
+                ledger.add_lot(asset, qty, cost_basis, tx)
+                
+                if not is_sell and tx.type != TransactionType.deposit:
+                    tx.cost_basis_ils = cost_basis
 
 
         # 4. Handle Crypto Fee Disposals (CRITICAL ITA)
@@ -356,7 +358,7 @@ class TaxEngine:
             # Fallback for missing cost basis: ITA default assumes ZERO
             if fee_cost_basis == 0 and fee_qty > 0:
                 tx.is_issue = True
-                tx.issue_notes = (tx.issue_notes or \"\") + f\" | Missing cost basis for fee ({fee_asset}). ITA default assumes ZERO.\"
+                tx.issue_notes = (tx.issue_notes or "") + f" | Missing cost basis for fee ({fee_asset}). ITA default assumes ZERO."
 
             # Capital gain on the fee itself
             fee_gain = fee_proceeds - fee_cost_basis
