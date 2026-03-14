@@ -5,12 +5,19 @@ from app.models.tax_lot_consumption import TaxLotConsumption
 from app.services.boi import boi_service
 from app.services.cpi import cpi_service
 from app.services.price import price_service
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import List, Dict, Any, Optional, Set
 import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
+
+def get_jerusalem_date(ts: datetime) -> date:
+    """Localize UTC timestamp to Asia/Jerusalem before extracting the date."""
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(ZoneInfo("Asia/Jerusalem")).date()
 
 class TaxLedger:
     def __init__(self, db: AsyncSession):
@@ -29,7 +36,7 @@ class TaxLedger:
         qty_to_match = qty
         consumptions = []
         
-        cpi_sell = await cpi_service.get_cpi_index(sell_tx.timestamp.date(), self.db)
+        cpi_sell = await cpi_service.get_cpi_index(get_jerusalem_date(sell_tx.timestamp), self.db)
         
         while qty_to_match > 1e-10 and self.inventory[asset]:
             oldest_buy = self.inventory[asset][0]
@@ -48,7 +55,7 @@ class TaxLedger:
                 oldest_buy['cost_basis_ils'] -= matched_cost
 
             # CPI Adjustment (Madad)
-            cpi_buy = await cpi_service.get_cpi_index(buy_timestamp.date(), self.db)
+            cpi_buy = await cpi_service.get_cpi_index(get_jerusalem_date(buy_timestamp), self.db)
             cpi_ratio = max(1.0, cpi_sell / cpi_buy)
             
             adjusted_cost_basis_ils = matched_cost * cpi_ratio
@@ -87,19 +94,18 @@ class TaxLedger:
                     # Calculate proportion
                     match_qty = min(remaining_buy_qty, loss_entry['amount'])
                     proportion = match_qty / loss_entry['amount']
-                    matched_loss_ils = loss_entry['loss_ils'] * proportion
+                    match_loss = loss_entry['loss_ils'] * proportion
                     
-                    deferred_loss += matched_loss_ils
+                    deferred_loss += match_loss
+                    loss_entry['loss_ils'] -= match_loss
+                    loss_entry['amount'] -= match_qty
                     remaining_buy_qty -= match_qty
                     
-                    # Keep the unused portion of the loss if we didn't consume it all
-                    if match_qty < loss_entry['amount']:
-                        loss_entry['amount'] -= match_qty
-                        loss_entry['loss_ils'] -= matched_loss_ils
-                        retained_losses.append(loss_entry)
-                else:
+                    logger.info(f"Wash Sale: TX {tx.id} lot increased by {match_loss} ILS from deferred loss on TX {loss_entry['tx_id']}")
+                
+                if loss_entry['amount'] > 1e-10:
                     retained_losses.append(loss_entry)
-                    
+            
             self.recent_losses[asset] = retained_losses
 
         self.inventory[asset].append({
@@ -148,29 +154,31 @@ class TaxEngine:
     def __init__(self):
         pass
 
-    async def calculate_taxes(self, db: AsyncSession, use_wash_sale_rule: bool = False):
-        # 0. Clean up previous calculations
-        await db.execute(delete(TaxLotConsumption))
-        
-        # 1. Fetch all transactions
-        txs_stmt = select(Transaction).order_by(Transaction.timestamp.asc())
-        result = await db.execute(txs_stmt)
+    async def run_tax_pipeline(self, db: AsyncSession, year: Optional[int] = None, use_wash_sale_rule: bool = False):
+        """
+        Main pipeline to process transactions and update capital gains.
+        1. Fetch all transactions (ordered by time).
+        2. Filter out non-taxable internal transfers.
+        3. Merge simultaneous 'dust' or small trades (Avalanche Merger).
+        4. Run valuation to get ILS values for all movements.
+        5. Run the FIFO tax engine.
+        """
+        # 1. Fetch
+        stmt = select(Transaction).order_by(Transaction.timestamp.asc())
+        result = await db.execute(stmt)
         all_txs = result.scalars().all()
         
-        if not all_txs:
-            return
-
-        # Phase 1: Pre-Processing & Classification
+        # 2. Merger
         await self._run_avalanche_merger(all_txs, db)
+        
+        # 3. Transfers
         reconciled_ids = await self._run_transfer_reconciliation(all_txs, db)
         
-        # Filter active transactions for Phase 2 and 3
+        # 4. Valuation
         active_txs = [t for t in all_txs if t.is_active]
-
-        # Phase 2: Valuation (Pricing everything to ILS)
         await self._run_valuation(active_txs, db)
         
-        # Phase 3: The FIFO Ledger
+        # 5. FIFO Engine
         ledger = TaxLedger(db)
         for tx in active_txs:
             await self._process_transaction(tx, ledger, reconciled_ids, db, use_wash_sale_rule=use_wash_sale_rule)
@@ -181,7 +189,8 @@ class TaxEngine:
         i = 0
         while i < len(txs):
             curr = txs[i]
-            if not curr.is_active or curr.type not in [TransactionType.buy, TransactionType.sell]:
+            # ITA Rule: Dust conversions and swaps (convert) are taxable events that should be merged if simultaneous.
+            if not curr.is_active or curr.type not in [TransactionType.buy, TransactionType.sell, TransactionType.convert, TransactionType.dust]:
                 i += 1
                 continue
             
@@ -263,38 +272,37 @@ class TaxEngine:
         return reconciled_ids
     async def _run_valuation(self, txs: List[Transaction], db: AsyncSession):
         if not txs: return
-        
-        min_date = txs[0].timestamp.date()
-        max_date = txs[-1].timestamp.date()
+
+        min_date = get_jerusalem_date(txs[0].timestamp)
+        max_date = get_jerusalem_date(txs[-1].timestamp)
         await boi_service.prefetch_rates(min_date, max_date, db=db)
-        
+
         rate_cache: Dict[date, float] = {}
 
         for tx in txs:
-            rate_date = tx.timestamp.date()
+            rate_date = get_jerusalem_date(tx.timestamp)
             if rate_date not in rate_cache:
                 rate_cache[rate_date] = await boi_service.get_usd_ils_rate(rate_date, db=db)
-            
+
             tx.ils_exchange_rate = rate_cache[rate_date]
             tx.ils_rate_date = rate_date
-
     async def get_ils_value(self, asset: str, amount: float, tx_date: date, usd_ils_rate: float) -> float:
         if not asset or amount == 0:
             return 0.0
         if asset == 'ILS':
             return amount
-            
+
         rate = usd_ils_rate or 3.65
-        
+
         if asset in ['USD', 'USDT', 'USDC', 'BUSD', 'DAI']:
             return amount * rate
-        
+
         usd_price = await price_service.get_historical_price(asset, tx_date)
         if usd_price is not None:
             val = amount * usd_price * rate
             logger.info(f"Price: {asset} on {tx_date} is ${usd_price}, ILS value: {val}")
             return val
-        
+
         logger.warning(f"MISSING PRICE: {asset} on {tx_date}")
         return 0.0
 
@@ -308,7 +316,7 @@ class TaxEngine:
         tx.is_taxable_event = 0
 
         rate = tx.ils_exchange_rate or 3.65
-        tx_date = tx.timestamp.date()
+        tx_date = get_jerusalem_date(tx.timestamp)
 
         # 1. Handle Kraken Futures PnL (Special Case)
         if tx.exchange == 'krakenfutures' and tx.type in [TransactionType.fee, TransactionType.earn] and (tx.asset_from in ['USD', 'BTC', 'XBT'] or tx.asset_to in ['USD', 'BTC', 'XBT']):
@@ -336,6 +344,15 @@ class TaxEngine:
             effective_swap_value = val_to
         else:
             effective_swap_value = val_to if val_to > 0 else val_from
+
+        # Fallback for fee_ils if external price fetch failed
+        if fee_ils == 0 and (tx.fee_amount or 0) > 0 and tx.fee_asset:
+            if tx.fee_asset == tx.asset_from and amt_from > 0:
+                fee_ils = (effective_swap_value / amt_from) * tx.fee_amount
+                logger.info(f"Fee fallback: {tx.fee_asset} used asset_from unit price. fee_ils={fee_ils}")
+            elif tx.fee_asset == tx.asset_to and amt_to > 0:
+                fee_ils = (effective_swap_value / amt_to) * tx.fee_amount
+                logger.info(f"Fee fallback: {tx.fee_asset} used asset_to unit price. fee_ils={fee_ils}")
 
         # 2. Process Disposal (Sell / Withdrawal / Fee)
         is_sell = amt_from > 0 and tx.asset_from
@@ -442,7 +459,8 @@ class TaxEngine:
         txs_by_year: Dict[int, List[Transaction]] = {}
         for tx in all_txs:
             if not tx.is_active: continue
-            y = tx.timestamp.year
+            # ITA Rule: Fiscal year must follow Jerusalem Time.
+            y = get_jerusalem_date(tx.timestamp).year
             if y not in txs_by_year: txs_by_year[y] = []
             txs_by_year[y].append(tx)
         
@@ -485,6 +503,19 @@ class TaxEngine:
         }
 
     async def get_years(self, db: AsyncSession) -> List[int]:
-        stmt = select(distinct(extract('year', Transaction.timestamp))).order_by(extract('year', Transaction.timestamp).desc())
+        # We fetch distinct years from UTC first as a rough set
+        stmt = select(distinct(extract('year', Transaction.timestamp)))
         result = await db.execute(stmt)
-        return [int(row[0]) for row in result.all() if row[0] is not None]
+        base_years = [int(row[0]) for row in result.all() if row[0] is not None]
+        
+        # Then we specifically check for edge cases near Jan 1st
+        # In reality, grouping by get_jerusalem_date(timestamp).year is the only 100% correct way.
+        # Since the number of transactions is manageable, we'll fetch all active timestamps.
+        stmt = select(Transaction.timestamp).where(Transaction.is_active == True)
+        result = await db.execute(stmt)
+        years = set()
+        for row in result.all():
+            if row[0]:
+                years.add(get_jerusalem_date(row[0]).year)
+        
+        return sorted(list(years), reverse=True) if years else sorted(base_years, reverse=True)
