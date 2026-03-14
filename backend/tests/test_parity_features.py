@@ -1,6 +1,6 @@
 import pytest
 import pytest_asyncio
-from app.services.tax_engine import tax_engine
+from app.services.tax_engine import TaxEngine
 from app.models.transaction import Transaction, TransactionType
 from app.models.exchange_key import ExchangeKey
 from app.db.session import AsyncSessionLocal, Base, engine
@@ -53,11 +53,11 @@ async def test_avalanche_merge():
         db.add(buy_tx)
         await db.commit()
 
-        await tax_engine.calculate_taxes(db)
+        await TaxEngine().calculate_taxes(db)
         
-        # After calculation, internal tax_engine.calculate_taxes logic merges txs
+        # After calculation, internal TaxEngine().calculate_taxes logic merges txs
         # Note: calculate_taxes UPDATES the transactions in DB.
-        # However, our current tax_engine.calculate_taxes implementation in the prompt
+        # However, our current TaxEngine().calculate_taxes implementation in the prompt
         # replaces the local `txs` list with `merged_txs`, but it only `db.add(tx)` for the txs in the merged list.
         # This means the original individual transactions that were NOT the first in a group
         # are NOT updated and NOT added to session. 
@@ -73,7 +73,7 @@ async def test_avalanche_merge():
         assert merged_sell.amount_from == pytest.approx(0.3)
         assert merged_sell.amount_to == pytest.approx(15000.0)
         assert merged_sell.fee_amount == pytest.approx(3.0)
-        assert "Merged 3 trades" in merged_sell.raw_data
+        assert \"Merged 3 trades\" in merged_sell.raw_data
         
         # The other 2 sells should have been skipped (no cost_basis_ils updated from default 0.0)
         other_sells = [s for s in sells if s.tx_hash in ['trade_1', 'trade_2']]
@@ -99,14 +99,14 @@ async def test_missing_cost_basis():
         db.add(tx)
         await db.commit()
         
-        await tax_engine.calculate_taxes(db)
+        await TaxEngine().calculate_taxes(db)
         
         stmt = select(Transaction).filter(Transaction.tx_hash == 'sell_no_cost')
         result = await db.execute(stmt)
         updated_tx = result.scalars().first()
         
         assert updated_tx.is_issue is True
-        assert "Missing cost basis" in updated_tx.issue_notes
+        assert \"Missing cost basis\" in updated_tx.issue_notes
 
 @pytest.mark.asyncio
 async def test_transfer_linking():
@@ -136,7 +136,7 @@ async def test_transfer_linking():
         db.add(d)
         await db.commit()
         
-        await tax_engine.calculate_taxes(db)
+        await TaxEngine().calculate_taxes(db)
         
         # Refresh from DB to get IDs
         stmt = select(Transaction).filter(Transaction.tx_hash.in_(['tx_w', 'tx_d']))
@@ -147,8 +147,8 @@ async def test_transfer_linking():
         
         assert w_db.linked_transaction_id == d_db.id
         assert d_db.linked_transaction_id == w_db.id
-        assert w_db.category == "Transfer"
-        assert d_db.category == "Transfer"
+        assert w_db.category == \"Transfer\"
+        assert d_db.category == \"Transfer\"
 
 @pytest.mark.asyncio
 async def test_delete_data_source():

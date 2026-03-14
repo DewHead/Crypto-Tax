@@ -1,14 +1,14 @@
 import pytest
 import pytest_asyncio
-from app.services.tax_engine import tax_engine
+from app.services.tax_engine import TaxEngine
 from app.models.transaction import Transaction, TransactionType
 from app.db.session import AsyncSessionLocal, Base, engine
 from datetime import datetime
 
 # Use a test database
-TEST_DB_URL = "sqlite:///./test_ledger.db"
+TEST_DB_URL = \"sqlite:///./test_ledger.db\"
 
-@pytest_asyncio.fixture(scope="module")
+@pytest_asyncio.fixture(scope=\"module\")
 async def db():
     # Setup
     async with engine.begin() as conn:
@@ -55,7 +55,7 @@ async def test_fifo_simple_buy_sell(db):
     db.add(sell_tx)
     await db.commit()
     
-    await tax_engine.calculate_taxes(db)
+    await TaxEngine().calculate_taxes(db)
     
     # Check results
     from sqlalchemy import select
@@ -100,7 +100,7 @@ async def test_transfer_reconciliation(db):
     db.add(d_tx)
     await db.commit()
     
-    await tax_engine.calculate_taxes(db)
+    await TaxEngine().calculate_taxes(db)
     
     # Check that it's NOT a taxable event
     from sqlalchemy import select
