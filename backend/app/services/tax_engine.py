@@ -193,13 +193,13 @@ class TaxLedger:
                 time_diff = (tx_ts - lot_ts).total_seconds()
                 if 0 < time_diff <= 30 * 86400: # Bought within 30 days before sale
                     # This lot absorbs the loss
-                    absor_qty = min(remaining_qty, lot['amount'])
-                    absorb_proportion = absor_qty / amount
+                    absorb_qty = min(remaining_qty, lot['amount'])
+                    absorb_proportion = absorb_qty / amount
                     absorb_loss = loss_ils * absorb_proportion
                     
                     lot['cost_basis_ils'] += absorb_loss
                     remaining_loss -= absorb_loss
-                    remaining_qty -= absor_qty
+                    remaining_qty -= absorb_qty
                     
                     logger.info(f"Backward Wash Sale: TX {tx.id} loss {absorb_loss} absorbed by lot from TX {lot['tx_id']}")
 
@@ -541,6 +541,9 @@ class TaxEngine:
         result = await db.execute(stmt)
         all_txs = result.scalars().all()
         
+        from app.models.daily_valuation import DailyValuation
+        from sqlalchemy import func
+
         # 1. Form 1391 Check (Foreign Assets > 2M ILS)
         foreign_exchanges = set()
         keys_stmt = select(ExchangeKeyModel)
@@ -553,62 +556,23 @@ class TaxEngine:
         form_1391_breached = False
         threshold_ils = 2000000.0
         
-        inventory_by_exchange: Dict[str, Dict[str, float]] = {}
-        txs_by_date: Dict[date, List[Transaction]] = {}
-        for tx in all_txs:
-            d = get_jerusalem_date(tx.timestamp)
-            txs_by_date.setdefault(d, []).append(tx)
-
-        all_sorted_dates = sorted(txs_by_date.keys())
-        if all_sorted_dates:
-            first_date = all_sorted_dates[0]
+        # Query pre-calculated valuations from the database
+        val_stmt = select(
+            DailyValuation.date,
+            func.sum(DailyValuation.ils_value).label("total_ils")
+        ).where(DailyValuation.exchange.in_(list(foreign_exchanges)))
+        
+        if year:
+            val_stmt = val_stmt.where(extract('year', DailyValuation.date) == year)
             
-            # If a specific year is requested, we must check every day of that year
-            # starting from either Jan 1st or the first transaction ever.
-            if year:
-                curr = min(first_date, date(year, 1, 1))
-                end = min(date.today(), date(year, 12, 31))
-            else:
-                curr = first_date
-                end = all_sorted_dates[-1]
-
-            while curr <= end:
-                if curr in txs_by_date:
-                    for tx in txs_by_date[curr]:
-                        ex = tx.exchange.lower()
-                        if ex not in inventory_by_exchange: inventory_by_exchange[ex] = {}
-                        if tx.asset_from: inventory_by_exchange[ex][tx.asset_from] = inventory_by_exchange[ex].get(tx.asset_from, 0.0) - (tx.amount_from or 0.0)
-                        if tx.asset_to: inventory_by_exchange[ex][tx.asset_to] = inventory_by_exchange[ex].get(tx.asset_to, 0.0) + (tx.amount_to or 0.0)
-                        if tx.fee_asset: inventory_by_exchange[ex][tx.fee_asset] = inventory_by_exchange[ex].get(tx.fee_asset, 0.0) - (tx.fee_amount or 0.0)
-                
-                # Only check breach for the target year
-                if not year or curr.year == year:
-                    daily_foreign_val = 0.0
-                    # Quick check: does any foreign exchange have non-zero inventory?
-                    has_foreign_assets = False
-                    for ex in foreign_exchanges:
-                        if ex in inventory_by_exchange:
-                            if any(qty > 1e-8 for qty in inventory_by_exchange[ex].values()):
-                                has_foreign_assets = True
-                                break
-                    
-                    if has_foreign_assets:
-                        usd_ils_rate = await boi_service.get_usd_ils_rate(curr, db=db)
-                        for ex in foreign_exchanges:
-                            if ex in inventory_by_exchange:
-                                for asset, qty in inventory_by_exchange[ex].items():
-                                    if qty > 1e-8:
-                                        if asset not in ['USD', 'ILS']:
-                                            usd_price = await price_service.get_historical_price(asset, curr)
-                                            if usd_price: daily_foreign_val += qty * usd_price * usd_ils_rate
-                                        elif asset == 'USD':
-                                            daily_foreign_val += qty * usd_ils_rate
-                        
-                        if daily_foreign_val > max_daily_foreign_value_ils:
-                            max_daily_foreign_value_ils = daily_foreign_val
-                            if max_daily_foreign_value_ils > threshold_ils: form_1391_breached = True
-                
-                curr += timedelta(days=1)
+        val_stmt = val_stmt.group_by(DailyValuation.date)
+        val_result = await db.execute(val_stmt)
+        
+        for v_date, v_total in val_result.all():
+            if v_total > max_daily_foreign_value_ils:
+                max_daily_foreign_value_ils = v_total
+                if v_total > threshold_ils:
+                    form_1391_breached = True
 
         # 2. Tax KPIs
         accumulated_loss = 0.0

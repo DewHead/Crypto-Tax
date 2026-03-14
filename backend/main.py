@@ -5,6 +5,7 @@ from app.db.session import engine, Base
 from app.models.exchange_key import ExchangeKey
 from app.models.transaction import Transaction
 from app.models.ils_rate import ILSRate
+from app.models.daily_valuation import DailyValuation
 from app.services.ingestion import ingestion_service
 from contextlib import asynccontextmanager
 

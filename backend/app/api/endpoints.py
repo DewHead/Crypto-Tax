@@ -9,6 +9,7 @@ from app.schemas.exchange_key import ExchangeKeyCreate, ExchangeKeyResponse
 from app.services.ingestion import ingestion_service
 from app.services.csv_ingestion import csv_ingestion_service
 from app.services.tax_engine import TaxEngine
+from app.services.valuation import valuation_service
 from app.services.export import export_service
 from typing import List, Optional
 import csv
@@ -28,6 +29,7 @@ async def run_sync_and_calculate_background():
         await ingestion_service.sync_all()
         async with AsyncSessionLocal() as db:
             await TaxEngine().calculate_taxes(db)
+            await valuation_service.update_daily_valuations(db)
         print("Background full sync completed successfully.")
     except Exception as e:
         print(f"Error in background sync: {e}")
@@ -41,6 +43,7 @@ async def run_single_key_sync_background(key_id: int):
         await ingestion_service.sync_one(key_id)
         async with AsyncSessionLocal() as db:
             await TaxEngine().calculate_taxes(db)
+            await valuation_service.update_daily_valuations(db)
         print(f"Background sync for key {key_id} completed successfully.")
     except Exception as e:
         print(f"Error in background sync for key {key_id}: {e}")
@@ -54,6 +57,7 @@ async def process_zip_background(temp_path: str):
         await csv_ingestion_service.process_zip(temp_path)
         async with AsyncSessionLocal() as db:
             await TaxEngine().calculate_taxes(db)
+            await valuation_service.update_daily_valuations(db)
         print(f"Successfully processed ZIP file {temp_path} in background.")
     except Exception as e:
         print(f"Error in background ZIP processing: {e}")
