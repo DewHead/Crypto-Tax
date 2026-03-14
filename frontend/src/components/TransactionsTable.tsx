@@ -231,31 +231,32 @@ function ResolveModal({ tx, onClose, onSubmit, isSubmitting }: ResolveModalProps
 
           <div className="space-y-4">
             <div className="space-y-2">
-              <label className="text-sm font-bold ml-1">Original Cost Basis (Total ILS)</label>
+              <label className="text-sm font-bold ms-1">Original Cost Basis (Total ILS)</label>
               <div className="relative">
-                <div className="absolute left-4 top-1/2 -translate-y-1/2 text-muted-foreground font-bold">₪</div>
+                <div className="absolute start-4 top-1/2 -translate-y-1/2 text-muted-foreground font-bold">₪</div>
                 <input 
                   type="number"
                   step="0.01"
                   value={costBasis}
                   onChange={(e) => setCostBasis(e.target.value)}
                   placeholder="0.00"
-                  className="w-full bg-muted/30 border-muted/50 rounded-xl py-3 pl-10 pr-4 focus:ring-2 focus:ring-primary/20 focus:border-primary outline-none transition-all font-mono"
+                  className="w-full bg-muted/30 border-muted/50 rounded-xl py-3 ps-10 pe-4 focus:ring-2 focus:ring-primary/20 focus:border-primary outline-none transition-all font-mono"
                   autoFocus
                 />
               </div>
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-bold ml-1">Original Purchase Date (Optional)</label>
+              <label className="text-sm font-bold ms-1">Original Purchase Date (Required)</label>
               <input 
                 type="date"
                 value={date}
                 onChange={(e) => setDate(e.target.value)}
                 className="w-full bg-muted/30 border-muted/50 rounded-xl py-3 px-4 focus:ring-2 focus:ring-primary/20 focus:border-primary outline-none transition-all"
+                required
               />
-              <p className="text-[10px] text-muted-foreground ml-1 uppercase font-bold tracking-wider">
-                Used for CPI (Madad) inflationary adjustment
+              <p className="text-[10px] text-muted-foreground ms-1 uppercase font-bold tracking-wider">
+                Required for CPI (Madad) inflationary adjustment
               </p>
             </div>
           </div>
@@ -266,15 +267,15 @@ function ResolveModal({ tx, onClose, onSubmit, isSubmitting }: ResolveModalProps
             Cancel
           </Button>
           <Button 
-            onClick={() => onSubmit(parseFloat(costBasis), date || undefined)} 
-            disabled={!costBasis || isSubmitting}
+            onClick={() => onSubmit(parseFloat(costBasis), date)} 
+            disabled={!costBasis || !date || isSubmitting}
             className="flex-1 rounded-xl h-12 font-bold shadow-lg shadow-primary/20"
           >
             {isSubmitting ? (
               <RefreshCw className="w-5 h-5 animate-spin" />
             ) : (
               <>
-                <CheckCircle2 className="w-5 h-5 mr-2" />
+                <CheckCircle2 className="w-5 h-5 me-2" />
                 Apply Override
               </>
             )}
@@ -434,7 +435,7 @@ export default function TransactionsTable({ selectedYear }: TransactionsTablePro
             className="rounded-full px-6 shadow-lg shadow-primary/20 text-base"
             data-testid="sync-button"
           >
-            <RefreshCw className={`w-5 h-5 mr-2 ${syncMutation.isPending || isSyncing ? 'animate-spin' : ''}`} />
+            <RefreshCw className={`w-5 h-5 me-2 ${syncMutation.isPending || isSyncing ? 'animate-spin' : ''}`} />
             {syncMutation.isPending || isSyncing ? 'Syncing...' : 'Sync History'}
           </Button>
           <Button
@@ -444,7 +445,7 @@ export default function TransactionsTable({ selectedYear }: TransactionsTablePro
             className="rounded-full px-6 bg-background/50 backdrop-blur-sm text-base"
             data-testid="export-button"
           >
-            <Download className="w-5 h-5 mr-2" />
+            <Download className="w-5 h-5 me-2" />
             Export 8659 (Tax Report)
           </Button>
         </div>

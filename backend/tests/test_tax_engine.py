@@ -65,6 +65,10 @@ async def test_fifo_simple_buy_sell(db):
     stmt = select(Transaction).filter(Transaction.tx_hash == '0x2')
     result = await db.execute(stmt)
     updated_sell = result.scalars().first()
+    # Cost basis for 0.5 BTC should be 5000 USD * ILS rate
+    # Let's check capital gain
+    # Proceeds = 7000 * rate, Cost = 5000 * rate
+    # Gain should be 2000 * rate
     assert updated_sell.capital_gain_ils > 0
     assert updated_sell.cost_basis_ils > 0
 

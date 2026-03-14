@@ -481,13 +481,11 @@ class TaxEngine:
 
             # If it's a reconciled transfer or fiat, skip adding to ledger completely
             if tx.id in reconciled_ids:
-                tx.is_taxable_event = 0
-                if not is_sell:
-                    tx.cost_basis_ils = 0.0 
+                # Don't overwrite if it was already marked taxable by disposal side
+                pass 
             elif is_fiat:
-                tx.is_taxable_event = 0
-                if not is_sell:
-                    tx.cost_basis_ils = 0.0
+                # Don't overwrite if it was already marked taxable by disposal side
+                pass
             else:
                 if tx.type in [TransactionType.earn, TransactionType.airdrop]:
                     cost_basis = val_to
@@ -495,7 +493,7 @@ class TaxEngine:
                     tx.ordinary_income_ils = cost_basis
                 elif tx.type == TransactionType.fork:
                     cost_basis = 0.0
-                    tx.is_taxable_event = 0
+                    # Don't overwrite taxable status
                 else:
                     # Swap or Buy
                     cost_basis = effective_swap_value
@@ -555,34 +553,57 @@ class TaxEngine:
         for tx in all_txs:
             d = get_jerusalem_date(tx.timestamp)
             txs_by_date.setdefault(d, []).append(tx)
+
+        all_sorted_dates = sorted(txs_by_date.keys())
+        if all_sorted_dates:
+            first_date = all_sorted_dates[0]
             
-        for d in sorted(txs_by_date.keys()):
-            for tx in txs_by_date[d]:
-                ex = tx.exchange.lower()
-                if ex not in inventory_by_exchange: inventory_by_exchange[ex] = {}
-                if tx.asset_from: inventory_by_exchange[ex][tx.asset_from] = inventory_by_exchange[ex].get(tx.asset_from, 0.0) - (tx.amount_from or 0.0)
-                if tx.asset_to: inventory_by_exchange[ex][tx.asset_to] = inventory_by_exchange[ex].get(tx.asset_to, 0.0) + (tx.amount_to or 0.0)
-                if tx.fee_asset: inventory_by_exchange[ex][tx.fee_asset] = inventory_by_exchange[ex].get(tx.fee_asset, 0.0) - (tx.fee_amount or 0.0)
-            
-            if year and d.year < year: continue
-            if year and d.year > year: break
-            
-            daily_foreign_val = 0.0
-            if any(ex in foreign_exchanges for ex in inventory_by_exchange):
-                usd_ils_rate = await boi_service.get_usd_ils_rate(d, db=db)
-                for ex in foreign_exchanges:
-                    if ex in inventory_by_exchange:
-                        for asset, qty in inventory_by_exchange[ex].items():
-                            if qty > 1e-8:
-                                if asset not in ['USD', 'ILS']:
-                                    usd_price = await price_service.get_historical_price(asset, d)
-                                    if usd_price: daily_foreign_val += qty * usd_price * usd_ils_rate
-                                elif asset == 'USD':
-                                    daily_foreign_val += qty * usd_ils_rate
+            # If a specific year is requested, we must check every day of that year
+            # starting from either Jan 1st or the first transaction ever.
+            if year:
+                curr = min(first_date, date(year, 1, 1))
+                end = min(date.today(), date(year, 12, 31))
+            else:
+                curr = first_date
+                end = all_sorted_dates[-1]
+
+            while curr <= end:
+                if curr in txs_by_date:
+                    for tx in txs_by_date[curr]:
+                        ex = tx.exchange.lower()
+                        if ex not in inventory_by_exchange: inventory_by_exchange[ex] = {}
+                        if tx.asset_from: inventory_by_exchange[ex][tx.asset_from] = inventory_by_exchange[ex].get(tx.asset_from, 0.0) - (tx.amount_from or 0.0)
+                        if tx.asset_to: inventory_by_exchange[ex][tx.asset_to] = inventory_by_exchange[ex].get(tx.asset_to, 0.0) + (tx.amount_to or 0.0)
+                        if tx.fee_asset: inventory_by_exchange[ex][tx.fee_asset] = inventory_by_exchange[ex].get(tx.fee_asset, 0.0) - (tx.fee_amount or 0.0)
                 
-                if daily_foreign_val > max_daily_foreign_value_ils:
-                    max_daily_foreign_value_ils = daily_foreign_val
-                    if max_daily_foreign_value_ils > threshold_ils: form_1391_breached = True
+                # Only check breach for the target year
+                if not year or curr.year == year:
+                    daily_foreign_val = 0.0
+                    # Quick check: does any foreign exchange have non-zero inventory?
+                    has_foreign_assets = False
+                    for ex in foreign_exchanges:
+                        if ex in inventory_by_exchange:
+                            if any(qty > 1e-8 for qty in inventory_by_exchange[ex].values()):
+                                has_foreign_assets = True
+                                break
+                    
+                    if has_foreign_assets:
+                        usd_ils_rate = await boi_service.get_usd_ils_rate(curr, db=db)
+                        for ex in foreign_exchanges:
+                            if ex in inventory_by_exchange:
+                                for asset, qty in inventory_by_exchange[ex].items():
+                                    if qty > 1e-8:
+                                        if asset not in ['USD', 'ILS']:
+                                            usd_price = await price_service.get_historical_price(asset, curr)
+                                            if usd_price: daily_foreign_val += qty * usd_price * usd_ils_rate
+                                        elif asset == 'USD':
+                                            daily_foreign_val += qty * usd_ils_rate
+                        
+                        if daily_foreign_val > max_daily_foreign_value_ils:
+                            max_daily_foreign_value_ils = daily_foreign_val
+                            if max_daily_foreign_value_ils > threshold_ils: form_1391_breached = True
+                
+                curr += timedelta(days=1)
 
         # 2. Tax KPIs
         accumulated_loss = 0.0

@@ -109,7 +109,7 @@ export default function ApiKeysManager() {
           className="w-full h-20 text-lg font-bold border-2 border-dashed border-primary/20 bg-primary/5 hover:bg-primary/10 text-primary"
           variant="outline"
         >
-          <Plus className="w-6 h-6 mr-2" />
+          <Plus className="w-6 h-6 me-2" />
           Add New Wallet (API or CSV)
         </Button>
       )}
@@ -128,10 +128,10 @@ export default function ApiKeysManager() {
             <table className="w-full caption-bottom text-base">
               <thead className="[&_tr]:border-b">
                 <tr className="border-b transition-colors hover:bg-muted/50">
-                  <th className="h-14 px-6 text-left align-middle font-medium text-muted-foreground">Exchange</th>
-                  <th className="h-14 px-6 text-left align-middle font-medium text-muted-foreground">Status</th>
-                  <th className="h-14 px-6 text-left align-middle font-medium text-muted-foreground">API Connection</th>
-                  <th className="h-14 px-6 text-left align-middle font-medium text-muted-foreground">Actions</th>
+                  <th className="h-14 px-6 text-start align-middle font-medium text-muted-foreground">Exchange</th>
+                  <th className="h-14 px-6 text-start align-middle font-medium text-muted-foreground">Status</th>
+                  <th className="h-14 px-6 text-start align-middle font-medium text-muted-foreground">API Connection</th>
+                  <th className="h-14 px-6 text-start align-middle font-medium text-muted-foreground">Actions</th>
                 </tr>
               </thead>
               <tbody className="[&_tr:last-child]:border-0">
@@ -166,7 +166,7 @@ export default function ApiKeysManager() {
                           disabled={key.is_syncing === 1}
                           className={`inline-flex items-center text-primary hover:text-primary/80 text-base font-medium disabled:opacity-50`}
                         >
-                          <RefreshCw className={`w-4 h-4 mr-1 ${key.is_syncing === 1 ? 'animate-spin' : ''}`} />
+                          <RefreshCw className={`w-4 h-4 me-1 ${key.is_syncing === 1 ? 'animate-spin' : ''}`} />
                           {key.is_syncing === 1 ? 'Syncing...' : 'Sync Now'}
                         </button>
                       ) : (
@@ -174,7 +174,7 @@ export default function ApiKeysManager() {
                           onClick={() => openWizard('api-setup', key.exchange_name)}
                           className="text-primary hover:text-primary/80 text-base font-medium inline-flex items-center"
                         >
-                          <Plus className="w-4 h-4 mr-1" />
+                          <Plus className="w-4 h-4 me-1" />
                           Connect API
                         </button>
                       )}
@@ -182,7 +182,7 @@ export default function ApiKeysManager() {
                         onClick={() => handleDelete(key.id, key.exchange_name)}
                         className="text-red-500 hover:text-red-700 text-base font-medium inline-flex items-center"
                       >
-                        <Trash2 className="w-4 h-4 mr-1" />
+                        <Trash2 className="w-4 h-4 me-1" />
                         Delete
                       </button>
                     </td>
@@ -210,10 +210,10 @@ export default function ApiKeysManager() {
             <table className="w-full caption-bottom text-base">
               <thead className="[&_tr]:border-b">
                 <tr className="border-b transition-colors hover:bg-muted/50">
-                  <th className="h-14 px-6 text-left align-middle font-medium text-muted-foreground">Exchange Source</th>
-                  <th className="h-14 px-6 text-left align-middle font-medium text-muted-foreground text-center">API Records</th>
-                  <th className="h-14 px-6 text-left align-middle font-medium text-muted-foreground text-center">CSV Records</th>
-                  <th className="h-14 px-6 text-left align-middle font-medium text-muted-foreground">Actions</th>
+                  <th className="h-14 px-6 text-start align-middle font-medium text-muted-foreground">Exchange Source</th>
+                  <th className="h-14 px-6 text-start align-middle font-medium text-muted-foreground text-center">API Records</th>
+                  <th className="h-14 px-6 text-start align-middle font-medium text-muted-foreground text-center">CSV Records</th>
+                  <th className="h-14 px-6 text-start align-middle font-medium text-muted-foreground">Actions</th>
                 </tr>
               </thead>
               <tbody className="[&_tr:last-child]:border-0">
@@ -222,7 +222,7 @@ export default function ApiKeysManager() {
                     <td className="p-6 align-middle font-medium">
                       {displayExchangeName(ds.exchange)}
                       {!ds.has_key && ds.api_count > 0 && (
-                        <span className="ml-2 text-[10px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full font-bold">API KEY MISSING</span>
+                        <span className="ms-2 text-[10px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full font-bold">API KEY MISSING</span>
                       )}
                     </td>
                     <td className="p-6 align-middle text-center font-mono">{ds.api_count.toLocaleString()}</td>
@@ -232,14 +232,14 @@ export default function ApiKeysManager() {
                         onClick={() => openWizard('csv-setup', ds.exchange)}
                         className="text-blue-500 hover:text-blue-700 text-base font-medium inline-flex items-center"
                       >
-                        <FileUp className="w-4 h-4 mr-1" />
+                        <FileUp className="w-4 h-4 me-1" />
                         Add CSV
                       </button>
                       <button 
                         onClick={() => handleDeleteDataSource(ds.exchange)}
                         className="text-red-500 hover:text-red-700 text-base font-medium inline-flex items-center"
                       >
-                        <AlertTriangle className="w-4 h-4 mr-1" />
+                        <AlertTriangle className="w-4 h-4 me-1" />
                         Wipe Data
                       </button>
                     </td>
