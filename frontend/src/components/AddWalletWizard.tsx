@@ -116,7 +116,7 @@ export default function AddWalletWizard({ onComplete, initialStep = 'choose-meth
         <CardContent className="grid gap-4">
           <button 
             onClick={() => setStep('api-setup')}
-            className="flex items-center gap-4 p-4 rounded-xl border-2 border-muted hover:border-primary hover:bg-primary/5 transition-all text-left group"
+            className="flex items-center gap-4 p-4 rounded-xl border-2 border-muted hover:border-primary hover:bg-primary/5 transition-all text-start group"
           >
             <div className="w-12 h-12 rounded-full bg-primary/10 flex items-center justify-center text-primary group-hover:scale-110 transition-transform">
               <RefreshCw className="w-6 h-6" />
@@ -130,7 +130,7 @@ export default function AddWalletWizard({ onComplete, initialStep = 'choose-meth
 
           <button 
             onClick={() => setStep('csv-setup')}
-            className="flex items-center gap-4 p-4 rounded-xl border-2 border-muted hover:border-primary hover:bg-primary/5 transition-all text-left group"
+            className="flex items-center gap-4 p-4 rounded-xl border-2 border-muted hover:border-primary hover:bg-primary/5 transition-all text-start group"
           >
             <div className="w-12 h-12 rounded-full bg-blue-500/10 flex items-center justify-center text-blue-500 group-hover:scale-110 transition-transform">
               <Upload className="w-6 h-6" />
@@ -144,7 +144,7 @@ export default function AddWalletWizard({ onComplete, initialStep = 'choose-meth
 
           <button 
             onClick={() => setStep('setup-later')}
-            className="flex items-center gap-4 p-4 rounded-xl border-2 border-muted hover:border-primary hover:bg-primary/5 transition-all text-left group"
+            className="flex items-center gap-4 p-4 rounded-xl border-2 border-muted hover:border-primary hover:bg-primary/5 transition-all text-start group"
           >
             <div className="w-12 h-12 rounded-full bg-amber-500/10 flex items-center justify-center text-amber-500 group-hover:scale-110 transition-transform">
               <Clock className="w-6 h-6" />
@@ -212,7 +212,7 @@ export default function AddWalletWizard({ onComplete, initialStep = 'choose-meth
               />
             </div>
             <Button type="submit" disabled={isProcessing} className="w-full text-base py-6">
-              {isProcessing ? <Loader2 className="w-5 h-5 animate-spin mr-2" /> : 'Connect Wallet'}
+              {isProcessing ? <Loader2 className="w-5 h-5 animate-spin me-2" /> : 'Connect Wallet'}
             </Button>
           </form>
         )}
@@ -236,12 +236,12 @@ export default function AddWalletWizard({ onComplete, initialStep = 'choose-meth
                 type="file" 
                 accept=".zip"
                 onChange={e => setFile(e.target.files?.[0] || null)}
-                className="w-full h-12 rounded-md border border-input bg-background px-3 py-2 text-sm file:mr-4 file:py-1 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-primary/10 file:text-primary hover:file:bg-primary/20"
+                className="w-full h-12 rounded-md border border-input bg-background px-3 py-2 text-sm file:me-4 file:py-1 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-primary/10 file:text-primary hover:file:bg-primary/20"
               />
               <p className="text-xs text-muted-foreground">Currently supports Binance &quot;All Statements&quot; or &quot;Trades&quot; ZIP files.</p>
             </div>
             <Button onClick={handleCsvUpload} disabled={isProcessing || !file} className="w-full text-base py-6">
-              {isProcessing ? <Loader2 className="w-5 h-5 animate-spin mr-2" /> : 'Upload & Import'}
+              {isProcessing ? <Loader2 className="w-5 h-5 animate-spin me-2" /> : 'Upload & Import'}
             </Button>
           </div>
         )}
@@ -264,7 +264,7 @@ export default function AddWalletWizard({ onComplete, initialStep = 'choose-meth
               This will create a wallet entry in your settings. You can add API keys or upload CSV files later to populate it with data.
             </p>
             <Button onClick={handleSetupLater} disabled={isProcessing} className="w-full text-base py-6">
-              {isProcessing ? <Loader2 className="w-5 h-5 animate-spin mr-2" /> : 'Create Placeholder'}
+              {isProcessing ? <Loader2 className="w-5 h-5 animate-spin me-2" /> : 'Create Placeholder'}
             </Button>
           </div>
         )}

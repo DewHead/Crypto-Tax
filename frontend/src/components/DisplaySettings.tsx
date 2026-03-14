@@ -30,7 +30,7 @@ export default function DisplaySettings() {
             size="lg"
             className="rounded-full px-6 text-base font-medium min-w-[200px]"
           >
-            <Filter className={`w-5 h-5 mr-2 ${showOnlyBinanceCSV ? 'fill-current' : ''}`} />
+            <Filter className={`w-5 h-5 me-2 ${showOnlyBinanceCSV ? 'fill-current' : ''}`} />
             {showOnlyBinanceCSV ? 'Showing Only CSV' : 'Show All Data'}
           </Button>
         </div>

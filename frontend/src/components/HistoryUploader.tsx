@@ -111,12 +111,12 @@ export default function HistoryUploader() {
         >
           {isUploading ? (
             <>
-              <Loader2 className="mr-3 h-5 w-5 animate-spin" />
+              <Loader2 className="me-3 h-5 w-5 animate-spin" />
               Processing...
             </>
           ) : (
             <>
-              <Upload className="mr-3 h-5 w-5" />
+              <Upload className="me-3 h-5 w-5" />
               Upload & Ingest History
             </>
           )}
