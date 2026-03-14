@@ -34,8 +34,8 @@ export default function TaxSummary({ selectedYear, taxBracket }: TaxSummaryProps
 
   if (isLoading) {
     return (
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-6 mb-8">
-        {[1, 2, 3, 4, 5].map((i) => (
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6 mb-8">
+        {[1, 2, 3, 4, 5, 6, 7].map((i) => (
           <Card key={i} className="bg-card/50 backdrop-blur-sm border-muted/50">
             <CardHeader className="flex flex-row items-center justify-between pb-2 space-y-0">
               <Skeleton className="h-4 w-24" />
@@ -67,7 +67,7 @@ export default function TaxSummary({ selectedYear, taxBracket }: TaxSummaryProps
       value: `₪${kpi?.net_capital_gain_ils?.toLocaleString() || '0'}`,
       subtitle: kpi?.carried_forward_loss_ils > 0 
         ? `₪${kpi?.carried_forward_loss_ils?.toLocaleString()} Loss Applied`
-        : 'After FIFO Matching',
+        : 'Field 91: Net Real Gain',
       icon: TrendingUp,
       color: kpi?.net_capital_gain_ils >= 0 ? 'text-green-500' : 'text-destructive',
       glow: kpi?.net_capital_gain_ils >= 0 
@@ -76,10 +76,31 @@ export default function TaxSummary({ selectedYear, taxBracket }: TaxSummaryProps
       id: 'total-gain'
     },
     {
+      title: 'Inflationary Gain',
+      value: `₪${kpi?.inflationary_gain_ils?.toLocaleString() || '0'}`,
+      subtitle: 'Field 256: Madad Adjustment',
+      icon: TrendingUp,
+      tooltip: 'Non-taxable inflationary component of your gains based on CPI (Madad).',
+      color: 'text-orange-400',
+      glow: 'shadow-[0_0_20px_-5px_oklch(0.7_0.15_60_/_0.1)]',
+      id: 'inflationary-gain'
+    },
+    {
+      title: 'Gross Capital Losses',
+      value: `₪${kpi?.capital_losses_ils?.toLocaleString() || '0'}`,
+      subtitle: 'Field 166: Total Losses',
+      icon: TrendingUp,
+      tooltip: 'Sum of all realized capital losses before offsetting gains.',
+      color: 'text-destructive',
+      glow: 'shadow-[0_0_20px_-5px_oklch(0.577_0.245_27.325_/_0.1)]',
+      id: 'capital-losses'
+    },
+    {
       title: 'Ordinary Income',
       value: `₪${kpi?.ordinary_income_ils?.toLocaleString() || '0'}`,
-      subtitle: 'Staking, Mining, Airdrops',
+      subtitle: 'Field 258/204: Earned',
       icon: TrendingUp,
+
       tooltip: 'Income recognized immediately upon receipt at fair market value.',
       color: 'text-blue-500',
       glow: 'shadow-[0_0_20px_-5px_oklch(0.6_0.15_240_/_0.2)]',
@@ -108,7 +129,7 @@ export default function TaxSummary({ selectedYear, taxBracket }: TaxSummaryProps
   ];
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-6 mb-8">
+    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6 mb-8">
       <AnimatePresence mode="popLayout">
         {cards.map((card, idx) => (
           <motion.div

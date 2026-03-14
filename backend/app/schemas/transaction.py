@@ -61,9 +61,12 @@ class KPIReport(BaseModel):
     total_nominal_gain_ils: float
     ordinary_income_ils: float
     net_capital_gain_ils: float
+    inflationary_gain_ils: float
+    capital_losses_ils: float
     carried_forward_loss_ils: float
     tax_bracket: float
     estimated_tax_ils: float
     trade_count: int
     total_transactions: int
     high_frequency_warning: bool
+    issue_count: int = 0

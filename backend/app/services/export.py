@@ -42,6 +42,10 @@ class ExportService:
             "Proceeds (ILS)", "Real Gain (ILS)", "Inflationary Gain (ILS)"
         ])
 
+        sum_real_gain = 0.0
+        sum_inflationary = 0.0
+        sum_losses = 0.0
+
         for row in consumptions:
             c: TaxLotConsumption = row[0]
             
@@ -63,7 +67,14 @@ class ExportService:
                 continue
             
             # Proceeds = real_gain + adjusted_cost_basis
-            proceeds = (c.real_gain_ils or 0.0) + (c.adjusted_cost_basis_ils or 0.0)
+            real_gain = (c.real_gain_ils or 0.0)
+            inflationary = (c.inflationary_gain_ils or 0.0)
+            proceeds = real_gain + (c.adjusted_cost_basis_ils or 0.0)
+
+            sum_real_gain += real_gain
+            sum_inflationary += inflationary
+            if real_gain < 0:
+                sum_losses += abs(real_gain)
 
             writer.writerow([
                 asset,
@@ -73,9 +84,32 @@ class ExportService:
                 f"{c.ils_value_consumed:.2f}",
                 f"{c.adjusted_cost_basis_ils:.2f}",
                 f"{proceeds:.2f}",
-                f"{c.real_gain_ils:.2f}",
-                f"{c.inflationary_gain_ils:.2f}"
+                f"{real_gain:.2f}",
+                f"{inflationary:.2f}"
             ])
+            
+        # Add Ordinary Income Summary (Field 258/204)
+        from app.services.tax_engine import get_jerusalem_date, TransactionType
+        ordinary_stmt = select(Transaction).filter(
+            Transaction.is_active == True,
+            Transaction.ordinary_income_ils > 0
+        )
+        res_ord = await db.execute(ordinary_stmt)
+        ordinary_txs = res_ord.scalars().all()
+        sum_ordinary = 0.0
+        for t in ordinary_txs:
+            if year and get_jerusalem_date(t.timestamp).year != year:
+                continue
+            sum_ordinary += (t.ordinary_income_ils or 0.0)
+
+        # Append Summary Block
+        writer.writerow([])
+        writer.writerow(["--- FORM 1301 / 1391 SUMMARY ---"])
+        writer.writerow(["Field Number", "Description", "Value (ILS)"])
+        writer.writerow(["91", "Net Real Capital Gain", f"{max(0, sum_real_gain):.2f}"])
+        writer.writerow(["256", "Inflationary Gain", f"{sum_inflationary:.2f}"])
+        writer.writerow(["166", "Total Real Capital Losses", f"{sum_losses:.2f}"])
+        writer.writerow(["258/204", "Ordinary Income (Staking/Earn)", f"{sum_ordinary:.2f}"])
 
         return output.getvalue()
 

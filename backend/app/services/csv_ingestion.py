@@ -3,7 +3,7 @@ import os
 import re
 import zipfile
 import shutil
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 from app.models.transaction import Transaction, TransactionType
 from app.db.session import AsyncSessionLocal
@@ -30,13 +30,13 @@ class CSVIngestionService:
         groups = []
         for row in reader:
             ts_str = row['UTC_Time'].strip()
-            ts = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S')
+            ts = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
             
             added = False
             if groups:
                 last_group = groups[-1]
                 last_ts_str = last_group[0]['UTC_Time'].strip()
-                last_ts = datetime.strptime(last_ts_str, '%Y-%m-%d %H:%M:%S')
+                last_ts = datetime.strptime(last_ts_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
                 if abs((ts - last_ts).total_seconds()) <= 2:
                     last_group.append(row)
                     added = True
@@ -59,7 +59,7 @@ class CSVIngestionService:
 
         for group_rows in groups:
             ts_str = group_rows[0]['UTC_Time'].strip()
-            timestamp = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S')
+            timestamp = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
             ts = ts_str # for tx_hash
             rows = group_rows
 
@@ -138,25 +138,41 @@ class CSVIngestionService:
                         a_to = buy_side[0]['Coin'] # Heuristic: assume same asset for all buy rows in a group
                         q_to = total_buy_units * (q_from / total_sell_units) if total_sell_units > 0 else 0
                         
+                        # Reconstruct gross amount if fee was deducted from the received asset
+                        # Binance statements usually show net change.
+                        q_to_gross = q_to
+                        if f_asset == a_to:
+                            # If we bought BTC and the fee was also in BTC, q_to is likely already net.
+                            # We add the proportional fee back to get the gross amount for proper FIFO cost basis.
+                            prop_fee = f_amount * (q_from / total_sell_units)
+                            q_to_gross += prop_fee
+
                         await add_tx(Transaction(
                             exchange='binance', tx_hash=f"csv_stmt_{ts}_{a_from}_{a_to}_trd_{group_rows.index(s)}",
                             timestamp=timestamp, type=TransactionType.buy if a_from in ['USD', 'EUR', 'USDT'] else TransactionType.sell,
                             asset_from=a_from, amount_from=q_from,
-                            asset_to=a_to, amount_to=q_to,
+                            asset_to=a_to, amount_to=q_to_gross,
                             fee_asset=f_asset, fee_amount=f_amount * (q_from / total_sell_units) if f_amount and total_sell_units > 0 else 0,
                             source='csv'
                         ))
 
                 else:
                     for r in buy_side:
+                        # Reconstruct gross amount if fee was deducted
+                        q_to = float(r['Change'])
+                        if f_asset == r['Coin']:
+                            q_to += f_amount / len(buy_side) # Rough split
+
                         await add_tx(Transaction(
                             exchange='binance', tx_hash=f"csv_stmt_{ts}_{r['Coin']}_buy_{group_rows.index(r)}",
-                            timestamp=timestamp, type=TransactionType.buy, asset_to=r['Coin'], amount_to=float(r['Change']), source='csv'
+                            timestamp=timestamp, type=TransactionType.buy, asset_to=r['Coin'], amount_to=q_to,
+                            fee_asset=f_asset, fee_amount=f_amount / len(buy_side) if f_amount else 0, source='csv'
                         ))
                     for r in sell_side:
                         await add_tx(Transaction(
                             exchange='binance', tx_hash=f"csv_stmt_{ts}_{r['Coin']}_sell_{group_rows.index(r)}",
-                            timestamp=timestamp, type=TransactionType.sell, asset_from=r['Coin'], amount_from=abs(float(r['Change'])), source='csv'
+                            timestamp=timestamp, type=TransactionType.sell, asset_from=r['Coin'], amount_from=abs(float(r['Change'])),
+                            fee_asset=f_asset, fee_amount=f_amount / len(sell_side) if f_amount else 0, source='csv'
                         ))
 
     async def _process_binance_trades(self, lines: List[str], db: Optional[AsyncSession] = None, tx_buffer: List[Transaction] = None, flush_callback = None):
@@ -170,7 +186,7 @@ class CSVIngestionService:
                 await self._save_transaction(tx, db=db)
 
         for row in reader:
-            timestamp = datetime.strptime(row['Date(UTC)'], '%Y-%m-%d %H:%M:%S')
+            timestamp = datetime.strptime(row['Date(UTC)'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
             side = row['Side'].upper(); pair = row['Pair']
             def parse_val(s):
                 match = re.match(r"([0-9\.]+)\s*([A-Z]+)", s)

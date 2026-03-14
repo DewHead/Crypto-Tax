@@ -17,11 +17,24 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { buttonVariants } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
-import { ChevronDown, Percent } from 'lucide-react';
+import { ChevronDown, Percent, AlertTriangle, X } from 'lucide-react';
+import { useQuery } from '@tanstack/react-query';
+import api from '@/lib/api';
 
 export default function Home() {
   const [selectedYear, setSelectedYear] = useState<number | null>(new Date().getFullYear());
   const [taxBracket, setTaxBracket] = useState<number>(0.25);
+  const [isBannerDismissed, setIsBannerDismissed] = useState(false);
+
+  const { data: kpi } = useQuery({
+    queryKey: ['kpi', selectedYear, taxBracket],
+    queryFn: async () => {
+      const { data } = await api.get('/kpi', {
+        params: { year: selectedYear, tax_bracket: taxBracket }
+      });
+      return data;
+    },
+  });
 
   return (
     <div className="flex flex-col h-screen overflow-hidden bg-muted/20">
@@ -70,6 +83,36 @@ export default function Home() {
       </header>
 
       <main className="flex-1 flex flex-col min-h-0 space-y-6 p-10 pt-8 container mx-auto max-w-7xl overflow-hidden">
+        {kpi?.issue_count > 0 && !isBannerDismissed && (
+          <div className="bg-amber-500/10 border border-amber-500/20 rounded-2xl p-6 flex items-start gap-5 animate-in fade-in slide-in-from-top-4 duration-500">
+            <div className="bg-amber-500 rounded-full p-2 mt-1">
+              <AlertTriangle className="w-6 h-6 text-white" />
+            </div>
+            <div className="flex-1">
+              <h3 className="text-lg font-bold text-amber-700">Warning: Missing Purchase History</h3>
+              <p className="text-amber-800/80 mt-1 max-w-2xl leading-relaxed">
+                We found {kpi.issue_count} transactions with missing cost basis. For these events, the engine falls back to <b>Zero Cost Basis</b>, potentially inflating your tax bill significantly.
+              </p>
+              <div className="flex gap-4 mt-4">
+                <Link href="/settings" className="text-sm font-bold bg-amber-500 text-white px-4 py-2 rounded-lg hover:bg-amber-600 transition-colors">
+                  Upload Missing CSVs
+                </Link>
+                <button 
+                  onClick={() => setIsBannerDismissed(true)}
+                  className="text-sm font-bold text-amber-600 hover:text-amber-700"
+                >
+                  I understand the risk, proceed
+                </button>
+              </div>
+            </div>
+            <button 
+              onClick={() => setIsBannerDismissed(true)}
+              className="text-muted-foreground hover:text-foreground transition-colors"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+        )}
         <TaxSummary selectedYear={selectedYear} taxBracket={taxBracket} />
         <TransactionsTable selectedYear={selectedYear} />
       </main>

@@ -49,7 +49,8 @@ class TaxLedger:
                 self.inventory[asset].pop(0)
             else:
                 matched_qty = qty_to_match
-                matched_cost = oldest_buy['cost_basis_ils'] * (matched_qty / oldest_buy['amount'])
+                unit_cost = oldest_buy['cost_basis_ils'] / oldest_buy['amount']
+                matched_cost = unit_cost * matched_qty
                 oldest_buy['amount'] -= matched_qty
                 oldest_buy['cost_basis_ils'] -= matched_cost
 
@@ -76,7 +77,11 @@ class TaxLedger:
         return total_cost_basis_ils, consumptions
 
     async def add_lot(self, asset: str, amount: float, cost_basis_ils: float, tx: Transaction):
-        logger.info(f"Adding lot: {amount} {asset} at {cost_basis_ils} ILS from TX {tx.id} ({tx.timestamp})")
+        tx_ts = tx.timestamp
+        if tx_ts.tzinfo is None:
+            tx_ts = tx_ts.replace(tzinfo=timezone.utc)
+
+        logger.info(f"Adding lot: {amount} {asset} at {cost_basis_ils} ILS from TX {tx.id} ({tx_ts})")
         if asset not in self.inventory:
             self.inventory[asset] = []
         
@@ -88,36 +93,42 @@ class TaxLedger:
             retained_losses = []
             
             for loss_entry in self.recent_losses[asset]:
+                loss_ts = loss_entry['timestamp']
+                if loss_ts.tzinfo is None:
+                    loss_ts = loss_ts.replace(tzinfo=timezone.utc)
+
                 # If loss was triggered within 30 days of this buy
-                if abs((tx.timestamp - loss_entry['timestamp']).total_seconds()) <= 30 * 86400 and remaining_buy_qty > 0:
+                if abs((tx_ts - loss_ts).total_seconds()) <= 30 * 86400 and remaining_buy_qty > 0:
                     # Calculate proportion
                     match_qty = min(remaining_buy_qty, loss_entry['amount'])
                     proportion = match_qty / loss_entry['amount']
-                    match_loss = loss_entry['loss_ils'] * proportion
+                    matched_loss_ils = loss_entry['loss_ils'] * proportion
                     
-                    deferred_loss += match_loss
+                    deferred_loss += matched_loss_ils
                     remaining_buy_qty -= match_qty
                     
-                    # Update the deferred loss entry
-                    loss_entry['amount'] -= match_qty
-                    loss_entry['loss_ils'] -= match_loss
-                    
-                    if loss_entry['amount'] > 1e-8:
+                    # Keep the unused portion of the loss if we didn't consume it all
+                    if match_qty < loss_entry['amount']:
+                        loss_entry['amount'] -= match_qty
+                        loss_entry['loss_ils'] -= matched_loss_ils
                         retained_losses.append(loss_entry)
-                    
-                    logger.info(f"Wash Sale: TX {tx.id} deferred {match_loss} loss from TX {loss_entry['tx_id']}")
                 else:
                     retained_losses.append(loss_entry)
+                    
             self.recent_losses[asset] = retained_losses
 
         self.inventory[asset].append({
             'tx_id': tx.id,
             'amount': amount,
             'cost_basis_ils': cost_basis_ils + deferred_loss,
-            'timestamp': tx.timestamp
+            'timestamp': tx_ts
         })
 
     async def record_loss(self, asset: str, loss_ils: float, amount: float, tx: Transaction):
+        tx_ts = tx.timestamp
+        if tx_ts.tzinfo is None:
+            tx_ts = tx_ts.replace(tzinfo=timezone.utc)
+
         # 30-Day Wash Sale Rule (Section 94B): Backward Part
         # If we bought replacement assets 30 days BEFORE this loss-triggering sale
         remaining_loss = loss_ils
@@ -129,7 +140,11 @@ class TaxLedger:
                 if remaining_qty <= 0 or remaining_loss <= 0:
                     break
                     
-                time_diff = (tx.timestamp - lot['timestamp']).total_seconds()
+                lot_ts = lot['timestamp']
+                if lot_ts.tzinfo is None:
+                    lot_ts = lot_ts.replace(tzinfo=timezone.utc)
+
+                time_diff = (tx_ts - lot_ts).total_seconds()
                 if 0 < time_diff <= 30 * 86400: # Bought within 30 days before sale
                     # This lot absorbs the loss
                     absorb_qty = min(remaining_qty, lot['amount'])
@@ -146,7 +161,7 @@ class TaxLedger:
             if asset not in self.recent_losses:
                 self.recent_losses[asset] = []
             self.recent_losses[asset].append({
-                'timestamp': tx.timestamp,
+                'timestamp': tx_ts,
                 'loss_ils': remaining_loss,
                 'amount': remaining_qty,
                 'tx_id': tx.id
@@ -156,42 +171,36 @@ class TaxEngine:
     def __init__(self):
         pass
 
-    async def calculate_taxes(self, db: AsyncSession):
-        logger.info("Starting tax calculation pipeline...")
-        # 1. Fetch all active transactions
-        stmt = select(Transaction).filter(Transaction.is_active == True).order_by(Transaction.timestamp.asc())
-        result = await db.execute(stmt)
-        txs = result.scalars().all()
-        
-        if not txs:
-            logger.info("No transactions found. Skipping calculation.")
-            return
-
-        # 2. Avalanche Merger (Consolidate dust/swaps)
-        await self._run_avalanche_merger(txs, db)
-        
-        # 3. Transfer Reconciliation
-        reconciled_ids = await self._run_transfer_reconciliation(txs, db)
-        
-        # 4. Valuation (Prefetch boi rates)
-        await self._run_valuation(txs, db)
-        
-        # 5. FIFO Processing
-        ledger = TaxLedger(db)
-        
-        # Clear old consumptions
+    async def calculate_taxes(self, db: AsyncSession, use_wash_sale_rule: bool = False):
+        # 0. Clean up previous calculations
         await db.execute(delete(TaxLotConsumption))
         
-        for tx in txs:
-            if not tx.is_active: continue
-            await self._process_transaction(tx, ledger, reconciled_ids, db, use_wash_sale_rule=True)
-            
+        # 1. Fetch all transactions
+        txs_stmt = select(Transaction).order_by(Transaction.timestamp.asc())
+        result = await db.execute(txs_stmt)
+        all_txs = result.scalars().all()
+        
+        if not all_txs:
+            return
+
+        # Phase 1: Pre-Processing & Classification
+        await self._run_avalanche_merger(all_txs, db)
+        reconciled_ids = await self._run_transfer_reconciliation(all_txs, db)
+        
+        # Filter active transactions for Phase 2 and 3
+        active_txs = [t for t in all_txs if t.is_active]
+
+        # Phase 2: Valuation (Pricing everything to ILS)
+        await self._run_valuation(active_txs, db)
+        
+        # Phase 3: The FIFO Ledger
+        ledger = TaxLedger(db)
+        for tx in active_txs:
+            await self._process_transaction(tx, ledger, reconciled_ids, db, use_wash_sale_rule=use_wash_sale_rule)
+
         await db.commit()
-        logger.info("Tax calculation pipeline completed.")
 
     async def _run_avalanche_merger(self, txs: List[Transaction], db: AsyncSession):
-        # Merges sequential small swaps/conversions of the same asset pair within 1 second
-        # This prevents inventory fragmentation and huge audit reports.
         i = 0
         while i < len(txs):
             curr = txs[i]
@@ -200,32 +209,39 @@ class TaxEngine:
                 i += 1
                 continue
             
+            curr_ts = curr.timestamp
+            if curr_ts.tzinfo is None:
+                curr_ts = curr_ts.replace(tzinfo=timezone.utc)
+
             j = i + 1
+            merged_count = 0
             while j < len(txs):
                 nxt = txs[j]
-                if not nxt.is_active: 
-                    j += 1
-                    continue
+                nxt_ts = nxt.timestamp
+                if nxt_ts.tzinfo is None:
+                    nxt_ts = nxt_ts.replace(tzinfo=timezone.utc)
                 
-                time_diff = (nxt.timestamp - curr.timestamp).total_seconds()
-                if time_diff > 1.0: break
-                
-                if (nxt.exchange == curr.exchange and 
+                time_diff = (nxt_ts - curr_ts).total_seconds()
+                if (nxt.is_active and
+                    nxt.exchange == curr.exchange and 
+                    nxt.type == curr.type and 
                     nxt.asset_from == curr.asset_from and 
                     nxt.asset_to == curr.asset_to and 
-                    nxt.type == curr.type):
+                    time_diff <= 5):
                     
-                    # Merge nxt into curr
                     curr.amount_from = (curr.amount_from or 0.0) + (nxt.amount_from or 0.0)
                     curr.amount_to = (curr.amount_to or 0.0) + (nxt.amount_to or 0.0)
                     curr.fee_amount = (curr.fee_amount or 0.0) + (nxt.fee_amount or 0.0)
                     
                     nxt.is_active = False
                     nxt.parent_tx_id = curr.id
-                    logger.info(f"Avalanche Merger: TX {nxt.id} merged into TX {curr.id}")
+                    merged_count += 1
                     j += 1
                 else:
                     break
+            
+            if merged_count > 0:
+                curr.raw_data = (curr.raw_data or "") + f" | Merged {merged_count + 1} trades."
             i = j
 
     async def _run_transfer_reconciliation(self, txs: List[Transaction], db: AsyncSession) -> Set[int]:
@@ -245,16 +261,29 @@ class TaxEngine:
 
             for w in asset_withdrawals:
                 w_amt = w.amount_from or 0.0
+                w_ts = w.timestamp
+                if w_ts.tzinfo is None:
+                    w_ts = w_ts.replace(tzinfo=timezone.utc)
 
                 # Fast-forward deposit pointer to ignore old deposits
-                while d_idx < d_len and (asset_deposits[d_idx].timestamp - w.timestamp).total_seconds() < 0:
-                    d_idx += 1
+                while d_idx < d_len:
+                    d_ts = asset_deposits[d_idx].timestamp
+                    if d_ts.tzinfo is None:
+                        d_ts = d_ts.replace(tzinfo=timezone.utc)
+                    if (d_ts - w_ts).total_seconds() < 0:
+                        d_idx += 1
+                    else:
+                        break
 
                 # Scan deposits inside the 24h window
                 curr_d_idx = d_idx
                 while curr_d_idx < d_len:
                     d = asset_deposits[curr_d_idx]
-                    time_diff = (d.timestamp - w.timestamp).total_seconds()
+                    d_ts = d.timestamp
+                    if d_ts.tzinfo is None:
+                        d_ts = d_ts.replace(tzinfo=timezone.utc)
+                    
+                    time_diff = (d_ts - w_ts).total_seconds()
 
                     if time_diff > 86400: break # Window closed
 
@@ -296,14 +325,21 @@ class TaxEngine:
     async def get_ils_value(self, asset: str, amount: float, tx_date: date, usd_ils_rate: float) -> float:
         if not asset or amount == 0:
             return 0.0
+        if asset == 'ILS':
+            return amount
+            
+        rate = usd_ils_rate or 3.65
         
-        if asset == 'ILS': return amount
-        if asset == 'USD': return amount * usd_ils_rate
+        if asset in ['USD', 'USDT', 'USDC', 'BUSD', 'DAI']:
+            return amount * rate
         
-        price_usd = await price_service.get_historical_price(asset, tx_date)
-        if price_usd:
-            return amount * price_usd * usd_ils_rate
+        usd_price = await price_service.get_historical_price(asset, tx_date)
+        if usd_price is not None:
+            val = amount * usd_price * rate
+            logger.info(f"Price: {asset} on {tx_date} is ${usd_price}, ILS value: {val}")
+            return val
         
+        logger.warning(f"MISSING PRICE: {asset} on {tx_date}")
         return 0.0
 
     async def _process_transaction(self, tx: Transaction, ledger: TaxLedger, reconciled_ids: Set[int], db: AsyncSession, use_wash_sale_rule: bool = False):
@@ -335,11 +371,13 @@ class TaxEngine:
         amt_to = tx.amount_to or 0.0
         val_from = await self.get_ils_value(tx.asset_from, amt_from, tx_date, rate)
         val_to = await self.get_ils_value(tx.asset_to, amt_to, tx_date, rate)
-        fee_ils = await self.get_ils_value(tx.fee_asset, tx.fee_amount, tx_date, rate)
+        fee_ils = await self.get_ils_value(tx.fee_asset, tx.fee_amount or 0.0, tx_date, rate)
 
-        # Effective Swap Value (FMV of the transaction)
-        if val_from > 0 and val_to > 0:
-            effective_swap_value = (val_from + val_to) / 2
+        # For swaps, we use fiat value if available, otherwise FMV of acquired/disposed asset.
+        if tx.asset_from in ['USD', 'ILS']:
+            effective_swap_value = val_from
+        elif tx.asset_to in ['USD', 'ILS']:
+            effective_swap_value = val_to
         else:
             effective_swap_value = val_to if val_to > 0 else val_from
 
@@ -398,9 +436,9 @@ class TaxEngine:
         if is_buy:
             asset = tx.asset_to
             qty = amt_to
-            is_fiat = asset in ['USD', 'ILS']
 
-            if is_fiat:
+            # If it's a reconciled transfer, skip adding to ledger completely
+            if tx.id in reconciled_ids:
                 tx.is_taxable_event = 0
                 tx.cost_basis_ils = 0.0 
             else:
@@ -420,6 +458,7 @@ class TaxEngine:
                 
                 if not is_sell and tx.type != TransactionType.deposit:
                     tx.cost_basis_ils = cost_basis
+
 
         # 4. Handle Crypto Fee Disposals (CRITICAL ITA)
         f_amt = tx.fee_amount or 0.0
@@ -452,6 +491,9 @@ class TaxEngine:
         report_year_ordinary = 0.0
         report_year_trade_count = 0
         report_year_total_nominal_gain = 0.0 
+        report_year_inflationary_gain = 0.0
+        report_year_capital_losses = 0.0
+        report_year_issue_count = 0
         
         txs_by_year: Dict[int, List[Transaction]] = {}
         for tx in all_txs:
@@ -466,15 +508,22 @@ class TaxEngine:
             # If Real Gain < 0, it's a loss that can offset other capital gains.
             y_nominal_gain = sum(t.capital_gain_ils or 0.0 for t in txs_by_year[y] if t.is_taxable_event)
             y_real_gain = sum(t.real_gain_ils or 0.0 for t in txs_by_year[y] if t.is_taxable_event)
+            y_inflationary_gain = sum(t.inflationary_gain_ils or 0.0 for t in txs_by_year[y] if t.is_taxable_event)
             y_ordinary = sum(t.ordinary_income_ils or 0.0 for t in txs_by_year[y])
             
+            # ITA Form 1391: Sum of only negative real gains this year
+            y_capital_losses = sum(abs(t.real_gain_ils) for t in txs_by_year[y] if t.is_taxable_event and t.real_gain_ils < 0)
+
             if year and y < year:
                 accumulated_loss += y_real_gain
                 if accumulated_loss > 0: accumulated_loss = 0.0 
             elif year is None or y == year:
                 report_year_trade_count += len([t for t in txs_by_year[y] if t.is_taxable_event and t.capital_gain_ils != 0])
                 report_year_total_nominal_gain += y_nominal_gain
+                report_year_inflationary_gain += y_inflationary_gain
+                report_year_capital_losses += y_capital_losses
                 report_year_ordinary += y_ordinary
+                report_year_issue_count += len([t for t in txs_by_year[y] if t.is_issue])
                 
                 net_real_gain = y_real_gain + accumulated_loss
                 if net_real_gain < 0:
@@ -484,19 +533,22 @@ class TaxEngine:
                     report_year_real_gain = net_real_gain
                     accumulated_loss = 0.0
         
-        all_tx_count = len([t for t in all_txs if (year is None or t.timestamp.year == year) and t.is_active])
+        all_tx_count = len([t for t in all_txs if (year is None or get_jerusalem_date(t.timestamp).year == year) and t.is_active])
         
         return {
             'year': year,
             'total_nominal_gain_ils': round(report_year_total_nominal_gain, 2),
             'ordinary_income_ils': round(report_year_ordinary, 2),
             'net_capital_gain_ils': round(report_year_real_gain, 2),
+            'inflationary_gain_ils': round(report_year_inflationary_gain, 2),
+            'capital_losses_ils': round(report_year_capital_losses, 2),
             'carried_forward_loss_ils': round(abs(min(0, accumulated_loss)), 2),
             'tax_bracket': tax_bracket,
             'estimated_tax_ils': round(max(0, (report_year_real_gain * 0.25) + (report_year_ordinary * tax_bracket)), 2),
             'trade_count': report_year_trade_count,
             'total_transactions': all_tx_count,
-            'high_frequency_warning': report_year_trade_count > 100
+            'high_frequency_warning': report_year_trade_count > 100,
+            'issue_count': report_year_issue_count
         }
 
     async def get_years(self, db: AsyncSession) -> List[int]:
