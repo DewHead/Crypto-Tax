@@ -1,58 +1,18 @@
-# Environments
+node_modules
+.next
+dist
 .env
-.env.*
-backend/.env
-backend/.env.*
-
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-venv/
-.venv/
-.pytest_cache/
-backend/venv/
-
-# Node
-node_modules/
-frontend/node_modules/
-.next/
-frontend/.next/
-dist/
-build/
-
-# Logs
-*.log
-backend/server.log
-backend/uvicorn.log
-uvicorn.log
-
-# Database
+.env.local
+backend/venv
+__pycache__
+*.pyc
+.pytest_cache
 *.db
-!backend/ledger.db # Keep schema if it's a template, but usually .db is ignored. 
-# Actually, I'll ignore ledger.db as it likely contains user data.
-ledger.db
-backend/ledger.db
-
-# Personal/Sensitive Data
-bloxtax_kabessa.tal_gmail.com_38862/
-temp_csv/
-
-# IDEs
-.vscode/
-.idea/
-
-# Gemini / Agent internal folders
-.agent/
-.agents/
-.claude/
-.crush/
-.factory/
-.gemini/
-.goose/
-.mux/
-.pi/
-.zencoder/
-skills-lock.json
-
-gha-creds-*.json
+*.db-journal
+*.db-shm
+*.db-wal
+temp_csv
+bloxtax_*
+.DS_Store
+frontend/test-results
+frontend/playwright-report
