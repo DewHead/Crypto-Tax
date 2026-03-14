@@ -5,5 +5,5 @@ class CPIRate(Base):
     __tablename__ = "cpi_rates"
 
     id = Column(Integer, primary_key=True, index=True)
-    date = Column(Date, unique=True, index=True, nullable=False) # Usually the 15th of each month
+    date = Column(Date, unique=True, index=True, nullable=False) # Start of the month
     index_value = Column(Float, nullable=False)
