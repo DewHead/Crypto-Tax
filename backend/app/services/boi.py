@@ -45,11 +45,10 @@ class BOIService:
         if not rates:
             return
         
-        if db:
-            await self._save_to_db_internal(rates, db)
-        else:
-            async with AsyncSessionLocal() as db_session:
-                await self._save_to_db_internal(rates, db_session)
+        # Always use a dedicated session for background rate updates
+        # to avoid committing or rolling back the caller's session.
+        async with AsyncSessionLocal() as db_session:
+            await self._save_to_db_internal(rates, db_session)
 
     async def _save_to_db_internal(self, rates: Dict[date, float], db: AsyncSession):
         try:

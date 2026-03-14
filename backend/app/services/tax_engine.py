@@ -21,8 +21,9 @@ def get_jerusalem_date(ts: datetime) -> date:
     return ts.astimezone(ZoneInfo("Asia/Jerusalem")).date()
 
 class TaxLedger:
-    def __init__(self, db: AsyncSession):
+    def __init__(self, db: AsyncSession, dry_run: bool = False):
         self.db = db
+        self.dry_run = dry_run
         self.inventory: Dict[str, List[Dict[str, Any]]] = {}
         self.recent_losses: Dict[str, List[Dict[str, Any]]] = {} # asset -> list of {'timestamp', 'loss_ils', 'amount'}
 
@@ -61,17 +62,20 @@ class TaxLedger:
                 ils_value_consumed=original_cost,
                 adjusted_cost_basis_ils=adjusted_cost
             )
-            self.db.add(consumption)
+            if not self.dry_run:
+                self.db.add(consumption)
             
             # Reset issue status if it was previously flagged
-            sell_tx.is_issue = False
+            if not self.dry_run:
+                sell_tx.is_issue = False
             
             return original_cost, [consumption]
 
         if asset not in self.inventory or not self.inventory[asset]:
             # Missing cost basis - ITA rule: Default to ZERO
-            sell_tx.is_issue = True
-            sell_tx.issue_notes = (sell_tx.issue_notes or "") + f" | Missing cost basis for {asset}. ITA default assumes ZERO."
+            if not self.dry_run:
+                sell_tx.is_issue = True
+                sell_tx.issue_notes = (sell_tx.issue_notes or "") + f" | Missing cost basis for {asset}. ITA default assumes ZERO."
             return 0.0, []
 
         total_cost_basis_ils = 0.0
@@ -111,7 +115,8 @@ class TaxLedger:
                 ils_value_consumed=matched_cost,
                 adjusted_cost_basis_ils=adjusted_cost_basis_ils
             )
-            self.db.add(consumption)
+            if not self.dry_run:
+                self.db.add(consumption)
             consumptions.append(consumption)
 
             qty_to_match -= matched_qty
@@ -188,13 +193,13 @@ class TaxLedger:
                 time_diff = (tx_ts - lot_ts).total_seconds()
                 if 0 < time_diff <= 30 * 86400: # Bought within 30 days before sale
                     # This lot absorbs the loss
-                    absorb_qty = min(remaining_qty, lot['amount'])
-                    absorb_proportion = absorb_qty / amount
+                    absor_qty = min(remaining_qty, lot['amount'])
+                    absorb_proportion = absor_qty / amount
                     absorb_loss = loss_ils * absorb_proportion
                     
                     lot['cost_basis_ils'] += absorb_loss
                     remaining_loss -= absorb_loss
-                    remaining_qty -= absorb_qty
+                    remaining_qty -= absor_qty
                     
                     logger.info(f"Backward Wash Sale: TX {tx.id} loss {absorb_loss} absorbed by lot from TX {lot['tx_id']}")
 
@@ -680,7 +685,7 @@ class TaxEngine:
         active_txs = [t for t in all_txs if t.is_active]
         
         # Phase 3: The FIFO Ledger (Read-only simulation)
-        ledger = TaxLedger(db)
+        ledger = TaxLedger(db, dry_run=True)
         for tx in active_txs:
             amt_from = tx.amount_from or 0.0
             amt_to = tx.amount_to or 0.0
