@@ -1,9 +1,30 @@
 import pytest
+import pytest_asyncio
 from datetime import datetime, date, timedelta
 from app.models.transaction import Transaction, TransactionType
 from app.services.tax_engine import TaxEngine
+from app.db.session import Base
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from unittest.mock import AsyncMock, patch
+
+# Use a separate test database
+TEST_DB_URL = "sqlite+aiosqlite:///./test_yearly.db"
+test_engine = create_async_engine(TEST_DB_URL, connect_args={"check_same_thread": False})
+TestSessionLocal = async_sessionmaker(bind=test_engine, class_=AsyncSession, expire_on_commit=False)
+
+@pytest_asyncio.fixture(scope="module")
+async def db():
+    # Setup
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    
+    async with TestSessionLocal() as db_session:
+        yield db_session
+    
+    # Teardown
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
 
 @pytest.mark.asyncio
 async def test_loss_harvesting_carry_forward(db):
@@ -163,7 +184,7 @@ async def test_reconciliation_inventory_fee(db):
     
     # The withdrawal should have a fee_amount of 0.01
     await db.refresh(w)
-    assert w.fee_amount == 0.01
+    assert w.fee_amount == pytest.approx(0.01)
     assert w.fee_asset == 'BTC'
     
     assert w.is_taxable_event == 1

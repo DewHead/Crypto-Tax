@@ -11,6 +11,7 @@ import pytest_asyncio
 from app.db.session import Base
 from app.models.transaction import Transaction
 from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 # Use a dedicated test database
 TEST_DB_URL = "sqlite+aiosqlite:///./test_kraken_debug.db"

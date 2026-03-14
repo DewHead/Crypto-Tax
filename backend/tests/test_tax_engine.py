@@ -1,8 +1,12 @@
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy import select
 from app.services.tax_engine import TaxEngine
 from app.models.transaction import Transaction, TransactionType
+from app.models.daily_valuation import DailyValuation
+from app.models.exchange_key import ExchangeKey
+from app.models.tax_lot_consumption import TaxLotConsumption
 from app.db.session import Base
 from datetime import datetime
 from unittest.mock import AsyncMock, patch
@@ -12,7 +16,7 @@ TEST_DB_URL = "sqlite+aiosqlite:///./test_ledger.db"
 test_engine = create_async_engine(TEST_DB_URL, connect_args={"check_same_thread": False})
 TestSessionLocal = async_sessionmaker(bind=test_engine, class_=AsyncSession, expire_on_commit=False)
 
-@pytest_asyncio.fixture(scope="module")
+@pytest_asyncio.fixture(scope="function")
 async def db():
     # Setup
     async with test_engine.begin() as conn:
@@ -117,3 +121,56 @@ async def test_transfer_reconciliation(db):
     txs = result.scalars().all()
     for tx in txs:
         assert tx.is_taxable_event == 0
+
+@pytest.mark.asyncio
+async def test_ordinary_income_recognition(db):
+    # 1. Staking Reward (Earn)
+    earn_tx = Transaction(
+        exchange='Binance',
+        tx_hash='0x201',
+        timestamp=datetime(2025, 3, 1),
+        type=TransactionType.earn,
+        asset_to='ETH',
+        amount_to=0.1,
+        is_active=True
+    )
+    db.add(earn_tx)
+    
+    # 2. Airdrop
+    airdrop_tx = Transaction(
+        exchange='Kraken',
+        tx_hash='0x202',
+        timestamp=datetime(2025, 3, 15),
+        type=TransactionType.airdrop,
+        asset_to='SOL',
+        amount_to=10.0,
+        is_active=True
+    )
+    db.add(airdrop_tx)
+    await db.commit()
+    
+    with patch('app.services.boi.boi_service.prefetch_rates', AsyncMock()), \
+         patch('app.services.price.price_service.prefetch_prices', AsyncMock()), \
+         patch('app.services.boi.boi_service.get_usd_ils_rate', return_value=3.5), \
+         patch('app.services.price.price_service.get_historical_price', side_effect=[2000.0, 100.0]):
+        # ETH price = 2000 USD -> 7000 ILS. 0.1 ETH = 700 ILS.
+        # SOL price = 100 USD -> 350 ILS. 10 SOL = 3500 ILS.
+        await TaxEngine().calculate_taxes(db)
+    
+    # Verify Earn TX
+    stmt_earn = select(Transaction).filter(Transaction.tx_hash == '0x201')
+    res_earn = await db.execute(stmt_earn)
+    tx_earn = res_earn.scalars().first()
+    assert tx_earn.is_taxable_event == 1
+    assert tx_earn.ordinary_income_ils == pytest.approx(700.0)
+    
+    # Verify Airdrop TX
+    stmt_airdrop = select(Transaction).filter(Transaction.tx_hash == '0x202')
+    res_airdrop = await db.execute(stmt_airdrop)
+    tx_airdrop = res_airdrop.scalars().first()
+    assert tx_airdrop.is_taxable_event == 1
+    assert tx_airdrop.ordinary_income_ils == pytest.approx(3500.0)
+    
+    # Verify KPI
+    kpi = await TaxEngine().get_kpi(db, year=2025)
+    assert kpi['ordinary_income_ils'] == pytest.approx(4200.0)

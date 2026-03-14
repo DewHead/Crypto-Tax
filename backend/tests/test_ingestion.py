@@ -49,7 +49,7 @@ async def test_sync_all_initializes_krakenfutures():
             })
             
             # Verify sync_exchange was called for krakenfutures
-            service.sync_exchange.assert_called_once_with('krakenfutures', mock_instance, db=mock_session)
+            service.sync_exchange.assert_called_once_with('krakenfutures', mock_instance, 1, db=mock_session)
             
             # Verify close was called
             mock_instance.close.assert_called_once()
@@ -78,7 +78,7 @@ async def test_sync_exchange_kraken_global_fetch():
     # Mock _process_trade_to_tx
     service._process_trade_to_tx = AsyncMock()
     
-    await service.sync_exchange('kraken', mock_exchange, db=None)
+    await service.sync_exchange('kraken', mock_exchange, 1, db=None)
     
     # Verify load_markets was called
     mock_exchange.load_markets.assert_called_once()

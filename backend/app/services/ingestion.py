@@ -515,7 +515,7 @@ class IngestionService:
                         discovered_assets.add(detail['fromAsset']); discovered_assets.add('BNB')
                         tx = Transaction(
                             exchange='binance', tx_hash=str(detail['transId']), timestamp=datetime.fromtimestamp(float(d['operateTime']) / 1000.0),
-                            type=TransactionType.dust, asset_from=detail['fromAsset'], amount_from=float(detail['amount']),
+                            type=TransactionType.earn, asset_from=detail['fromAsset'], amount_from=float(detail['amount']),
                             asset_to='BNB', amount_to=float(detail.get('transferAmount', detail.get('amount', 0))),
                             fee_asset='BNB', fee_amount=float(detail.get('serviceChargeAmount', 0)),
                             is_taxable_event=1, source='api', category='Dust'

@@ -370,6 +370,7 @@ class TaxEngine:
         min_date = get_jerusalem_date(txs[0].timestamp)
         max_date = get_jerusalem_date(txs[-1].timestamp)
         await boi_service.prefetch_rates(min_date, max_date, db=db)
+        await cpi_service.prefetch_rates(min_date, max_date, db=db)
 
         # Prefetch crypto prices
         price_tasks = []

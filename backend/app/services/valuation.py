@@ -1,5 +1,5 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete, func
+from sqlalchemy import select, delete, func, insert
 from app.models.transaction import Transaction
 from app.models.exchange_key import ExchangeKey
 from app.models.daily_valuation import DailyValuation

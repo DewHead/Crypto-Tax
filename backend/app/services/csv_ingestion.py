@@ -101,7 +101,7 @@ class CSVIngestionService:
                         timestamp=timestamp, type=TransactionType.withdrawal, asset_from=r['Coin'], amount_from=abs(val), source='csv'
                     ))
 
-            # 4. Process Dust
+            # 4. Process Dust (Route as Earn to ensure FMV cost basis)
             if dust:
                 buy_bnb = [r for r in dust if float(r['Change']) > 0]
                 sell_coins = [r for r in dust if float(r['Change']) < 0]
@@ -117,7 +117,8 @@ class CSVIngestionService:
                             exchange='binance', tx_hash=f"csv_stmt_{ts}_{asset_from}_dust",
                             timestamp=timestamp, type=TransactionType.dust,
                             asset_from=asset_from, amount_from=amount_from,
-                            asset_to=asset_to, amount_to=total_amount_to * proportion, source='csv'
+                            asset_to=asset_to, amount_to=total_amount_to * proportion, source='csv',
+                            category='Dust'
                         ))
 
             # 5. Process Trades / Swaps (Remaining rows + Fees)
