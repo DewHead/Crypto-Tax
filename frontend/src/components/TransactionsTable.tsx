@@ -1,28 +1,7 @@
-'use client';
+"use client";
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import {
-  useReactTable,
-  getCoreRowModel,
-  getSortedRowModel,
-  flexRender,
-  createColumnHelper,
-  SortingState,
-} from '@tanstack/react-table';
-import { useVirtualizer } from '@tanstack/react-virtual';
-import { useRef, useMemo, useState } from 'react';
-import api, { ExchangeKey } from '@/lib/api';
-import { cn, formatDate } from '@/lib/utils';
-import { 
-  RefreshCw, 
-  Download, 
-  ReceiptText, 
-  AlertTriangle, 
-  Link as LinkIcon,
-  ArrowUpDown,
-  ChevronUp,
-  ChevronDown
-} from 'lucide-react';
+import api from '@/lib/api';
 import {
   Table,
   TableBody,
@@ -31,141 +10,37 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
+import { 
+  Download, 
+  RefreshCw, 
+  ArrowUpDown, 
+  ChevronUp, 
+  ChevronDown,
+  ReceiptText,
+  AlertCircle
+} from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
+import { 
+  flexRender, 
+  getCoreRowModel, 
+  useReactTable, 
+  getSortedRowModel,
+  SortingState,
+  ColumnDef
+} from '@tanstack/react-table';
+import { useState, useMemo, useRef } from 'react';
+import { format } from 'date-fns';
+import { toast } from 'sonner';
+import { motion } from 'framer-motion';
+import { cn } from '@/lib/utils';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import {
   Tooltip,
   TooltipContent,
+  TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { toast } from 'sonner';
-import { motion } from 'framer-motion';
-import { useSettings } from '@/providers/SettingsProvider';
-
-interface Transaction {
-  id: number;
-  timestamp: string;
-  exchange: string;
-  type: string;
-  asset_from: string;
-  amount_from: number;
-  asset_to: string;
-  amount_to: number;
-  cost_basis_ils: number;
-  capital_gain_ils: number;
-  is_taxable_event: number;
-  source: string;
-  is_issue: boolean;
-  issue_notes?: string;
-  category?: string;
-  linked_transaction_id?: number;
-}
-
-const columnHelper = createColumnHelper<Transaction>();
-
-const columns = [
-  columnHelper.accessor('timestamp', {
-    header: 'Date',
-    cell: (info) => (
-      <div className="flex flex-col">
-        <span className="font-mono text-[13px] text-muted-foreground">
-          {formatDate(info.getValue())}
-        </span>
-        {info.row.original.linked_transaction_id && (
-          <span className="flex items-center gap-1 text-[10px] text-blue-500 font-bold mt-1">
-            <LinkIcon className="w-2.5 h-2.5" />
-            LINKED
-          </span>
-        )}
-      </div>
-    ),
-  }),
-  columnHelper.accessor('exchange', {
-    header: 'Exchange',
-    cell: (info) => (
-      <span className="font-medium text-foreground capitalize text-base">{info.getValue()}</span>
-    ),
-  }),
-  columnHelper.accessor('type', {
-    header: 'Type',
-    cell: (info) => (
-      <div className="flex flex-col gap-1">
-        <Badge 
-          variant="outline"
-          className={`rounded-full px-3 py-0.5 text-xs font-bold border-none w-fit ${
-            info.getValue() === 'buy' 
-              ? 'bg-blue-500/10 text-blue-500' 
-              : info.getValue() === 'sell'
-              ? 'bg-orange-500/10 text-orange-600'
-              : 'bg-muted/50 text-muted-foreground'
-          }`}
-        >
-          {info.getValue().toUpperCase()}
-        </Badge>
-        {info.row.original.category && (
-          <Badge variant="outline" className="text-[10px] px-1.5 h-4 w-fit opacity-70">
-            {info.row.original.category}
-          </Badge>
-        )}
-      </div>
-    ),
-  }),
-  columnHelper.accessor((row) => `${row.amount_to} ${row.asset_to}`, {
-    id: 'asset',
-    header: 'Asset/Qty',
-    cell: (info) => <span className="font-semibold text-base">{info.getValue()}</span>,
-  }),
-  columnHelper.accessor('cost_basis_ils', {
-    header: 'Cost Basis (ILS)',
-    cell: (info) => (
-      <span className="font-mono tabular-nums text-base">
-        {info.getValue() ? `₪${info.getValue().toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '-'}
-      </span>
-    ),
-  }),
-  columnHelper.accessor('capital_gain_ils', {
-    header: 'Gain/Loss (ILS)',
-    cell: (info) => {
-      const val = info.getValue();
-      if (!val && val !== 0) return '-';
-      return (
-        <span className={`font-mono tabular-nums font-semibold text-base ${val >= 0 ? 'text-green-500' : 'text-destructive'}`}>
-          {val >= 0 ? '+' : ''}₪{val.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-        </span>
-      );
-    },
-  }),
-  columnHelper.accessor('is_taxable_event', {
-    header: 'Taxable',
-    cell: (info) => info.getValue() ? (
-      <Badge variant="outline" className="bg-green-500/10 border-green-500/20 text-green-600 font-black text-[11px] px-2 h-5">YES</Badge>
-    ) : (
-      <Badge variant="outline" className="bg-muted/10 border-muted/20 text-muted-foreground font-black text-[11px] px-2 h-5">NO</Badge>
-    ),
-  }),
-  columnHelper.accessor('is_issue', {
-    header: 'Issues',
-    cell: (info) => info.getValue() ? (
-      <Tooltip>
-        <TooltipTrigger className="flex justify-center">
-          <AlertTriangle className="w-5 h-5 text-amber-500 cursor-help" />
-        </TooltipTrigger>
-        <TooltipContent className="max-w-[300px] p-4 bg-amber-50 border-amber-200 text-amber-900">
-          <p className="font-bold mb-1">Data Issue Identified</p>
-          <p className="text-sm">{info.row.original.issue_notes}</p>
-        </TooltipContent>
-      </Tooltip>
-    ) : null,
-  }),
-  columnHelper.accessor('source', {
-    header: 'Source',
-    cell: (info) => (
-      <Badge variant="secondary" className="text-[10px] uppercase font-bold px-1.5 h-4 opacity-60">
-        {info.getValue()}
-      </Badge>
-    ),
-  }),
-];
 
 interface TransactionsTableProps {
   selectedYear: number | null;
@@ -173,9 +48,10 @@ interface TransactionsTableProps {
 
 export default function TransactionsTable({ selectedYear }: TransactionsTableProps) {
   const queryClient = useQueryClient();
-  const { showOnlyBinanceCSV } = useSettings();
-
-  const { data: transactions = [], isLoading } = useQuery<Transaction[]>({
+  const [sorting, setSorting] = useState<SortingState>([{ id: 'timestamp', desc: true }]);
+  const [isSyncing, setIsSyncing] = useState(false);
+  
+  const { data: transactions = [], isLoading } = useQuery({
     queryKey: ['ledger'],
     queryFn: async () => {
       const { data } = await api.get('/ledger');
@@ -183,63 +59,152 @@ export default function TransactionsTable({ selectedYear }: TransactionsTablePro
     },
   });
 
-  const filteredTransactions = useMemo(() => {
-    let filtered = transactions;
-    
-    // Filter by Binance CSV setting
-    if (showOnlyBinanceCSV) {
-      filtered = filtered.filter(tx => {
-        if (tx.exchange.toLowerCase() === 'binance') {
-          return tx.source === 'csv';
-        }
-        return true;
-      });
-    }
-
-    // Filter by selected year
-    if (selectedYear) {
-      filtered = filtered.filter(tx => {
-        const txYear = new Date(tx.timestamp).getFullYear();
-        return txYear === selectedYear;
-      });
-    }
-
-    return filtered;
-  }, [transactions, showOnlyBinanceCSV, selectedYear]);
-
   const syncMutation = useMutation({
-    mutationFn: () => api.post('/sync'),
-    onMutate: () => {
-      const toastId = toast.loading('Syncing transaction history...');
-      return { toastId };
+    mutationFn: async () => {
+      setIsSyncing(true);
+      await api.post('/sync');
     },
-    onSuccess: async (_, __, context) => {
-      await queryClient.invalidateQueries({ queryKey: ['ledger'] });
-      await queryClient.invalidateQueries({ queryKey: ['kpi'] });
-      toast.success('Sync started in background', { id: context?.toastId });
+    onSuccess: () => {
+      toast.success('Synchronization started in background');
+      // Periodically refresh while syncing might be active
+      const interval = setInterval(() => {
+        queryClient.invalidateQueries({ queryKey: ['ledger'] });
+        queryClient.invalidateQueries({ queryKey: ['kpi'] });
+      }, 3000);
+      setTimeout(() => {
+        clearInterval(interval);
+        setIsSyncing(false);
+      }, 30000);
     },
-    onError: (error, __, context) => {
-      toast.error(`Sync failed: ${error.message}`, { id: context?.toastId });
-    },
+    onError: () => {
+      toast.error('Failed to start sync');
+      setIsSyncing(false);
+    }
   });
 
-  const { data: keys = [] } = useQuery<ExchangeKey[]>({
-    queryKey: ['keys'],
-    queryFn: async () => {
-      const { data } = await api.get('/keys');
-      return data;
-    },
-    refetchInterval: (query) => {
-      const isAnySyncing = query.state.data?.some((key) => key.is_syncing === 1);
-      return isAnySyncing ? 3000 : 30000;
-    },
-  });
+  const filteredTransactions = useMemo(() => {
+    if (!selectedYear) return transactions;
+    return transactions.filter((tx: any) => new Date(tx.timestamp).getFullYear() === selectedYear);
+  }, [transactions, selectedYear]);
 
-  const isSyncing = keys.some((key) => key.is_syncing === 1);
-
-  const [sorting, setSorting] = useState<SortingState>([
-    { id: 'timestamp', desc: true }
-  ]);
+  const columns = useMemo<ColumnDef<any>[]>(() => [
+    {
+      accessorKey: 'timestamp',
+      header: 'Date',
+      cell: ({ row }) => (
+        <div className="flex flex-col">
+          <span className="font-semibold text-foreground whitespace-nowrap">
+            {format(new Date(row.original.timestamp), 'MMM dd, yyyy')}
+          </span>
+          <span className="text-[10px] text-muted-foreground/60 font-mono">
+            {format(new Date(row.original.timestamp), 'HH:mm:ss')}
+          </span>
+        </div>
+      ),
+    },
+    {
+      accessorKey: 'type',
+      header: 'Event',
+      cell: ({ row }) => {
+        const type = row.original.type;
+        const colors: any = {
+          buy: 'bg-green-500/10 text-green-500 border-green-500/20',
+          sell: 'bg-amber-500/10 text-amber-500 border-amber-500/20',
+          earn: 'bg-blue-500/10 text-blue-500 border-blue-500/20',
+          fee: 'bg-destructive/10 text-destructive border-destructive/20',
+        };
+        return (
+          <Badge variant="outline" className={cn("capitalize font-bold px-2.5 py-0.5 rounded-md", colors[type] || 'bg-muted text-muted-foreground')}>
+            {type}
+          </Badge>
+        );
+      },
+    },
+    {
+      id: 'assets',
+      header: 'Assets & Amounts',
+      cell: ({ row }) => {
+        const tx = row.original;
+        return (
+          <div className="flex flex-col gap-1">
+            {tx.amount_from > 0 && (
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-destructive/80">-</span>
+                <span className="text-sm font-medium">{tx.amount_from.toLocaleString(undefined, { maximumFractionDigits: 8 })}</span>
+                <span className="text-[10px] font-black bg-muted px-1.5 py-0.5 rounded text-muted-foreground">{tx.asset_from}</span>
+              </div>
+            )}
+            {tx.amount_to > 0 && (
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-green-500/80">+</span>
+                <span className="text-sm font-medium">{tx.amount_to.toLocaleString(undefined, { maximumFractionDigits: 8 })}</span>
+                <span className="text-[10px] font-black bg-muted px-1.5 py-0.5 rounded text-muted-foreground">{tx.asset_to}</span>
+              </div>
+            )}
+          </div>
+        );
+      },
+    },
+    {
+      accessorKey: 'cost_basis_ils',
+      header: 'Cost Basis',
+      cell: ({ row }) => (
+        <div className="flex flex-col">
+          <span className="text-sm font-bold">₪{row.original.cost_basis_ils?.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+          {row.original.purchase_date && (
+            <span className="text-[10px] text-muted-foreground/60">Bought {format(new Date(row.original.purchase_date), 'dd/MM/yy')}</span>
+          )}
+        </div>
+      ),
+    },
+    {
+      accessorKey: 'capital_gain_ils',
+      header: 'Capital Gain',
+      cell: ({ row }) => {
+        const gain = row.original.capital_gain_ils;
+        const real = row.original.real_gain_ils;
+        const infl = row.original.inflationary_gain_ils;
+        
+        if (row.original.is_taxable_event === 0) return <span className="text-muted-foreground/30">—</span>;
+        
+        return (
+          <div className="flex flex-col">
+             <div className={cn("text-sm font-bold flex items-center gap-1.5", gain >= 0 ? "text-green-500" : "text-destructive")}>
+              {gain >= 0 ? '+' : ''}₪{gain?.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+              {gain < 0 && (
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger>
+                      <AlertCircle className="w-3 h-3 opacity-50" />
+                    </TooltipTrigger>
+                    <TooltipContent className="max-w-xs p-3">
+                      <p className="font-bold mb-1">Wash Sale Applied</p>
+                      <p className="text-xs">This loss was deferred and added to the cost basis of a replacement purchase within 30 days.</p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              )}
+            </div>
+            {row.original.real_gain_ils !== undefined && (
+               <div className="flex gap-2">
+                  <span className="text-[9px] font-bold text-muted-foreground/50">REAL: ₪{real?.toFixed(0)}</span>
+                  <span className="text-[9px] font-bold text-orange-400/50">INFL: ₪{infl?.toFixed(0)}</span>
+               </div>
+            )}
+          </div>
+        );
+      },
+    },
+    {
+      accessorKey: 'exchange',
+      header: 'Source',
+      cell: ({ row }) => (
+        <Badge variant="secondary" className="text-[10px] font-black uppercase tracking-tighter opacity-70">
+          {row.original.exchange}
+        </Badge>
+      ),
+    },
+  ], []);
 
   const table = useReactTable({
     data: filteredTransactions,
@@ -257,28 +222,28 @@ export default function TransactionsTable({ selectedYear }: TransactionsTablePro
   const virtualizer = useVirtualizer({
     count: table.getRowModel().rows.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: () => 53,
+    estimateSize: () => 75,
     overscan: 10,
   });
 
   const handleExport = async () => {
     try {
-      toast.info('Generating Form 1399 export...');
-      const response = await api.get('/export/1399', { responseType: 'blob' });
+      toast.info('Generating Form 8659 (Tax Report) export...');
+      const response = await api.get('/export/8659', { responseType: 'blob' });
       const url = window.URL.createObjectURL(new Blob([response.data]));
       const link = document.createElement('a');
       link.href = url;
-      link.setAttribute('download', 'form_1399.csv');
+      link.setAttribute('download', 'form_8659.csv');
       document.body.appendChild(link);
       link.click();
       toast.success('Export downloaded');
     } catch {
-      toast.error('Failed to export Form 1399');
+      toast.error('Failed to export Form 8659');
     }
   };
 
   return (
-    <motion.div 
+    <motion.div
       initial={{ opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ delay: 0.5 }}
@@ -309,11 +274,10 @@ export default function TransactionsTable({ selectedYear }: TransactionsTablePro
             data-testid="export-button"
           >
             <Download className="w-5 h-5 mr-2" />
-            Export 1399
+            Export 8659 (Tax Report)
           </Button>
         </div>
-      </div>
-      
+      </div>      
       <div className="flex-1 overflow-auto scrollbar-thin scrollbar-thumb-muted" ref={parentRef}>
         <Table data-testid="ledger-table" className="relative border-separate border-spacing-0" containerClassName="overflow-visible">
           <TableHeader className="z-20">

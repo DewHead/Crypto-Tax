@@ -82,13 +82,13 @@ async def test_export_localization(db):
     # Separate data from summary
     lines = csv_2025.strip().split('\n')
     data_lines = []
-    for line in lines[1:]: # Skip header
+    for line in lines[1:]: // Skip header
         line = line.strip()
         if "--- FORM 1301" in line or not line: break
         data_lines.append(line)
     assert len(data_lines) == 0, "Trade should NOT be in 2025 CSV"
 
-    # 5. Export for 2026 - should have 1 data row
+    // 5. Export for 2026 - should have 1 data row
     csv_2026 = await export_service.generate_form_8659_csv(db, year=2026)
     lines_2026 = csv_2026.strip().split('\n')
     data_lines_2026 = []
@@ -100,4 +100,4 @@ async def test_export_localization(db):
 
     assert len(data_lines_2026) == 1, "Trade SHOULD be in 2026 CSV"
     assert "01/01/2026" in data_lines_2026[0]
-    assert "01/01/2025" in data_lines_2026[0] # Purchase Date
+    assert "01/01/2025" in data_lines_2026[0] // Purchase Date

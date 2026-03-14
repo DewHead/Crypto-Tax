@@ -1,149 +1,106 @@
+from typing import List, Dict, Any, Optional, Set
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, extract, distinct, delete
+from sqlalchemy import select, delete, extract, distinct, func
 from app.models.transaction import Transaction, TransactionType
 from app.models.tax_lot_consumption import TaxLotConsumption
 from app.services.boi import boi_service
-from app.services.cpi import cpi_service
 from app.services.price import price_service
+from app.services.cpi import cpi_service
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
-from typing import List, Dict, Any, Optional, Set
-import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
 
-def get_jerusalem_date(ts: datetime) -> date:
-    """Localize UTC timestamp to Asia/Jerusalem before extracting the date."""
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(ZoneInfo("Asia/Jerusalem")).date()
+def get_jerusalem_date(dt: datetime) -> date:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(ZoneInfo("Asia/Jerusalem")).date()
 
 class TaxLedger:
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.inventory: Dict[str, List[Dict[str, Any]]] = {}
-        self.recent_losses: Dict[str, List[Dict[str, Any]]] = {} # asset -> list of {'timestamp', 'loss_ils', 'amount'}
+        self.lots: Dict[str, List[Dict[str, Any]]] = {} # asset -> list of lots
+        self.recent_losses: Dict[str, List[Dict[str, Any]]] = {} # asset -> list of losses (for wash sales)
 
-    async def consume_lots(self, asset: str, qty: float, sell_tx: Transaction) -> tuple[float, List[TaxLotConsumption]]:
-        logger.info(f"Consuming {qty} {asset} for TX {sell_tx.id} ({sell_tx.timestamp})")
-        if asset not in self.inventory or not self.inventory[asset]:
-            sell_tx.is_issue = True
-            sell_tx.issue_notes = (sell_tx.issue_notes or "") + f" | Missing cost basis for {round(qty, 8)} {asset}."
+    async def add_lot(self, asset: str, amount: float, ils_value: float, tx: Transaction):
+        if asset not in self.lots:
+            self.lots[asset] = []
+        
+        self.lots[asset].append({
+            'amount': amount,
+            'cost_basis_ils': ils_value,
+            'timestamp': tx.timestamp,
+            'tx_id': tx.id
+        })
+        logger.info(f"Lot added: {amount} {asset} @ {ils_value} ILS (TX {tx.id})")
+
+    async def consume_lots(self, asset: str, amount: float, tx: Transaction) -> tuple[float, List[TaxLotConsumption]]:
+        if asset not in self.lots or not self.lots[asset]:
+            # Missing cost basis - ITA rule: Default to ZERO
             return 0.0, []
-
+        
+        remaining_to_consume = amount
         total_cost_basis_ils = 0.0
-        qty_to_match = qty
         consumptions = []
-        
-        cpi_sell = await cpi_service.get_cpi_index(get_jerusalem_date(sell_tx.timestamp), self.db)
-        
-        while qty_to_match > 1e-10 and self.inventory[asset]:
-            oldest_buy = self.inventory[asset][0]
-            buy_tx_id = oldest_buy['tx_id']
-            buy_timestamp = oldest_buy['timestamp']
-            
-            if oldest_buy['amount'] <= qty_to_match:
-                matched_qty = oldest_buy['amount']
-                matched_cost = oldest_buy['cost_basis_ils']
-                self.inventory[asset].pop(0)
-            else:
-                matched_qty = qty_to_match
-                unit_cost = oldest_buy['cost_basis_ils'] / oldest_buy['amount']
-                matched_cost = unit_cost * matched_qty
-                oldest_buy['amount'] -= matched_qty
-                oldest_buy['cost_basis_ils'] -= matched_cost
 
-            # CPI Adjustment (Madad)
-            cpi_buy = await cpi_service.get_cpi_index(get_jerusalem_date(buy_timestamp), self.db)
-            cpi_ratio = max(1.0, cpi_sell / cpi_buy)
+        # FIFO
+        while remaining_to_consume > 1e-9 and self.lots[asset]:
+            lot = self.lots[asset][0]
+            consume_qty = min(remaining_to_consume, lot['amount'])
             
-            adjusted_cost_basis_ils = matched_cost * cpi_ratio
-            total_cost_basis_ils += matched_cost
+            # Proportion of the lot's ILS cost basis
+            ils_cost = (consume_qty / lot['amount']) * lot['cost_basis_ils']
+            
+            # Israeli Tax Rules: Adjusted Cost Basis (CPI)
+            buy_date = get_jerusalem_date(lot['timestamp'])
+            sell_date = get_jerusalem_date(tx.timestamp)
+            
+            buy_index = await cpi_service.get_cpi_index(buy_date, db=self.db)
+            sell_index = await cpi_service.get_cpi_index(sell_date, db=self.db)
+            
+            # Inflation factor. If index dropped (deflation), factor is 1.0 (cost basis doesn't decrease)
+            inflation_factor = max(1.0, sell_index / buy_index) if buy_index > 0 else 1.0
+            adjusted_cost = ils_cost * inflation_factor
 
-            # Record consumption for audit trail
             consumption = TaxLotConsumption(
-                sell_tx_id=sell_tx.id,
-                buy_tx_id=buy_tx_id,
-                amount_consumed=matched_qty,
-                ils_value_consumed=matched_cost,
-                adjusted_cost_basis_ils=adjusted_cost_basis_ils
+                sell_tx_id=tx.id,
+                buy_tx_id=lot['tx_id'],
+                amount_consumed=consume_qty,
+                ils_value_consumed=ils_cost,
+                adjusted_cost_basis_ils=adjusted_cost
             )
             self.db.add(consumption)
             consumptions.append(consumption)
 
-            qty_to_match -= matched_qty
+            total_cost_basis_ils += ils_cost
+            lot['amount'] -= consume_qty
+            lot['cost_basis_ils'] -= ils_cost
+            remaining_to_consume -= consume_qty
+            
+            if lot['amount'] < 1e-9:
+                self.lots[asset].pop(0)
 
         return total_cost_basis_ils, consumptions
 
-    async def add_lot(self, asset: str, amount: float, cost_basis_ils: float, tx: Transaction):
-        tx_ts = tx.timestamp
-        if tx_ts.tzinfo is None:
-            tx_ts = tx_ts.replace(tzinfo=timezone.utc)
-
-        logger.info(f"Adding lot: {amount} {asset} at {cost_basis_ils} ILS from TX {tx.id} ({tx_ts})")
-        if asset not in self.inventory:
-            self.inventory[asset] = []
-        
-        # 30-Day Wash Sale Rule (Section 94B): Forward Part
-        # If we have recent deferred losses, add them to cost basis
-        deferred_loss = 0.0
-        if asset in self.recent_losses:
-            remaining_buy_qty = amount
-            retained_losses = []
-            
-            for loss_entry in self.recent_losses[asset]:
-                loss_ts = loss_entry['timestamp']
-                if loss_ts.tzinfo is None:
-                    loss_ts = loss_ts.replace(tzinfo=timezone.utc)
-
-                # If loss was triggered within 30 days of this buy
-                if abs((tx_ts - loss_ts).total_seconds()) <= 30 * 86400 and remaining_buy_qty > 0:
-                    # Calculate proportion
-                    match_qty = min(remaining_buy_qty, loss_entry['amount'])
-                    proportion = match_qty / loss_entry['amount']
-                    matched_loss_ils = loss_entry['loss_ils'] * proportion
-                    
-                    deferred_loss += matched_loss_ils
-                    remaining_buy_qty -= match_qty
-                    
-                    # Keep the unused portion of the loss if we didn't consume it all
-                    if match_qty < loss_entry['amount']:
-                        loss_entry['amount'] -= match_qty
-                        loss_entry['loss_ils'] -= matched_loss_ils
-                        retained_losses.append(loss_entry)
-                else:
-                    retained_losses.append(loss_entry)
-                    
-            self.recent_losses[asset] = retained_losses
-
-        self.inventory[asset].append({
-            'tx_id': tx.id,
-            'amount': amount,
-            'cost_basis_ils': cost_basis_ils + deferred_loss,
-            'timestamp': tx_ts
-        })
-
     async def record_loss(self, asset: str, loss_ils: float, amount: float, tx: Transaction):
+        """
+        Israeli Wash Sale Rule (Section 94B): 
+        If an asset is sold at a loss and a replacement is bought within 30 days before/after,
+        the loss is not realized but added to the cost basis of the replacement.
+        """
         tx_ts = tx.timestamp
-        if tx_ts.tzinfo is None:
-            tx_ts = tx_ts.replace(tzinfo=timezone.utc)
-
-        # 30-Day Wash Sale Rule (Section 94B): Backward Part
-        # If we bought replacement assets 30 days BEFORE this loss-triggering sale
+        if tx_ts.tzinfo is None: tx_ts = tx_ts.replace(tzinfo=timezone.utc)
+        
         remaining_loss = loss_ils
         remaining_qty = amount
-        
-        if asset in self.inventory:
-            # We look for lots in inventory acquired < 30 days before this sell
-            for lot in reversed(self.inventory[asset]):
-                if remaining_qty <= 0 or remaining_loss <= 0:
-                    break
-                    
-                lot_ts = lot['timestamp']
-                if lot_ts.tzinfo is None:
-                    lot_ts = lot_ts.replace(tzinfo=timezone.utc)
 
+        # Check for Forward Wash Sale (already bought replacement)
+        if asset in self.lots:
+            for lot in reversed(self.lots[asset]):
+                lot_ts = lot['timestamp']
+                if lot_ts.tzinfo is None: lot_ts = lot_ts.replace(tzinfo=timezone.utc)
+                
                 time_diff = (tx_ts - lot_ts).total_seconds()
                 if 0 < time_diff <= 30 * 86400: # Bought within 30 days before sale
                     # This lot absorbs the loss
@@ -169,38 +126,44 @@ class TaxLedger:
 
 class TaxEngine:
     def __init__(self):
-        pass
+        self.ledger: Optional[TaxLedger] = None
 
     async def calculate_taxes(self, db: AsyncSession, use_wash_sale_rule: bool = False):
-        # 0. Clean up previous calculations
+        logger.info("Starting tax calculation engine (Israeli Rules)...")
+        
+        # 1. Clear previous results (except manual notes/adjustments if we had any)
+        # For now, full reset for simplicity
         await db.execute(delete(TaxLotConsumption))
+        await db.execute(select(Transaction).filter(Transaction.is_active == True)) # Warming up
         
-        # 1. Fetch all transactions
-        txs_stmt = select(Transaction).order_by(Transaction.timestamp.asc())
-        result = await db.execute(txs_stmt)
-        all_txs = result.scalars().all()
+        # 2. Load and sort all active transactions
+        result = await db.execute(
+            select(Transaction)
+            .filter(Transaction.is_active == True)
+            .order_by(Transaction.timestamp.asc())
+        )
+        txs = result.scalars().all()
         
-        if not all_txs:
-            return
-
-        # Phase 1: Pre-Processing & Classification
-        await self._run_avalanche_merger(all_txs, db)
-        reconciled_ids = await self._run_transfer_reconciliation(all_txs, db)
+        # 3. Pre-process: Reconciliation (Transfers) and Merging (Avalanche/Dust)
+        await self._run_avalanche_merger(txs, db)
+        reconciled_ids = await self._run_transfer_reconciliation(txs, db)
         
-        # Filter active transactions for Phase 2 and 3
-        active_txs = [t for t in all_txs if t.is_active]
-
-        # Phase 2: Valuation (Pricing everything to ILS)
-        await self._run_valuation(active_txs, db)
+        # 4. Valuation: Fetch USD/ILS rates for all dates
+        await self._run_valuation(txs, db)
         
-        # Phase 3: The FIFO Ledger
-        ledger = TaxLedger(db)
-        for tx in active_txs:
-            await self._process_transaction(tx, ledger, reconciled_ids, db, use_wash_sale_rule=use_wash_sale_rule)
-
+        # 5. Process Ledger
+        self.ledger = TaxLedger(db)
+        for tx in txs:
+            await self._process_transaction(tx, self.ledger, reconciled_ids, db, use_wash_sale_rule=use_wash_sale_rule)
+            
         await db.commit()
+        logger.info("Tax calculation completed successfully.")
 
     async def _run_avalanche_merger(self, txs: List[Transaction], db: AsyncSession):
+        """
+        Binance dust conversions often appear as dozens of simultaneous small trades.
+        ITA allows grouping these into a single event if the FMV is small.
+        """
         i = 0
         while i < len(txs):
             curr = txs[i]
@@ -225,10 +188,10 @@ class TaxEngine:
                 if (nxt.is_active and
                     nxt.exchange == curr.exchange and 
                     nxt.type == curr.type and 
-                    nxt.asset_from == curr.asset_from and 
-                    nxt.asset_to == curr.asset_to and 
-                    time_diff <= 5):
+                    nxt.asset_to == curr.asset_to and
+                    time_diff < 1.0):
                     
+                    # Merge nxt into curr
                     curr.amount_from = (curr.amount_from or 0.0) + (nxt.amount_from or 0.0)
                     curr.amount_to = (curr.amount_to or 0.0) + (nxt.amount_to or 0.0)
                     curr.fee_amount = (curr.fee_amount or 0.0) + (nxt.fee_amount or 0.0)
@@ -236,13 +199,10 @@ class TaxEngine:
                     nxt.is_active = False
                     nxt.parent_tx_id = curr.id
                     merged_count += 1
-                    j += 1
-                else:
-                    break
-            
+                j += 1
             if merged_count > 0:
-                curr.raw_data = (curr.raw_data or "") + f" | Merged {merged_count + 1} trades."
-            i = j
+                logger.info(f"Merged {merged_count} dust/convert transactions into TX {curr.id}")
+            i += 1
 
     async def _run_transfer_reconciliation(self, txs: List[Transaction], db: AsyncSession) -> Set[int]:
         withdrawals = [t for t in txs if t.is_active and t.type == TransactionType.withdrawal]
@@ -325,21 +285,18 @@ class TaxEngine:
     async def get_ils_value(self, asset: str, amount: float, tx_date: date, usd_ils_rate: float) -> float:
         if not asset or amount == 0:
             return 0.0
+        
+        if asset == 'USD':
+            return amount * usd_ils_rate
         if asset == 'ILS':
             return amount
-            
-        rate = usd_ils_rate or 3.65
         
-        if asset in ['USD', 'USDT', 'USDC', 'BUSD', 'DAI']:
-            return amount * rate
+        # Try to get price from local DB/cache first
+        price_usd = await price_service.get_historical_price(asset, tx_date)
+        if price_usd:
+            return amount * price_usd * usd_ils_rate
         
-        usd_price = await price_service.get_historical_price(asset, tx_date)
-        if usd_price is not None:
-            val = amount * usd_price * rate
-            logger.info(f"Price: {asset} on {tx_date} is ${usd_price}, ILS value: {val}")
-            return val
-        
-        logger.warning(f"MISSING PRICE: {asset} on {tx_date}")
+        # Placeholder / Unknown
         return 0.0
 
     async def _process_transaction(self, tx: Transaction, ledger: TaxLedger, reconciled_ids: Set[int], db: AsyncSession, use_wash_sale_rule: bool = False):
@@ -369,15 +326,13 @@ class TaxEngine:
         # Pre-calculate values
         amt_from = tx.amount_from or 0.0
         amt_to = tx.amount_to or 0.0
+        
         val_from = await self.get_ils_value(tx.asset_from, amt_from, tx_date, rate)
         val_to = await self.get_ils_value(tx.asset_to, amt_to, tx_date, rate)
         fee_ils = await self.get_ils_value(tx.fee_asset, tx.fee_amount or 0.0, tx_date, rate)
 
-        # For swaps, we use fiat value if available, otherwise FMV of acquired/disposed asset.
-        if tx.asset_from in ['USD', 'ILS']:
-            effective_swap_value = val_from
-        elif tx.asset_to in ['USD', 'ILS']:
-            effective_swap_value = val_to
+        if tx.type == TransactionType.buy:
+            effective_swap_value = val_from if val_from > 0 else val_to
         else:
             effective_swap_value = val_to if val_to > 0 else val_from
 
@@ -436,9 +391,9 @@ class TaxEngine:
         if is_buy:
             asset = tx.asset_to
             qty = amt_to
+            is_fiat = asset in ['USD', 'ILS']
 
-            # If it's a reconciled transfer, skip adding to ledger completely
-            if tx.id in reconciled_ids:
+            if is_fiat:
                 tx.is_taxable_event = 0
                 tx.cost_basis_ils = 0.0 
             else:
@@ -458,7 +413,6 @@ class TaxEngine:
                 
                 if not is_sell and tx.type != TransactionType.deposit:
                     tx.cost_basis_ils = cost_basis
-
 
         # 4. Handle Crypto Fee Disposals (CRITICAL ITA)
         f_amt = tx.fee_amount or 0.0

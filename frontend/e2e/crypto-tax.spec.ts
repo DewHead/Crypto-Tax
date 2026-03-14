@@ -2,27 +2,44 @@ import { test, expect } from '@playwright/test';
 
 test.describe('Crypto Tax Dashboard E2E', () => {
   test.beforeEach(async ({ page }) => {
-    // Navigate to the dashboard
     await page.goto('/');
   });
 
-  test('Full Data Ingestion and UI Reactivity', async ({ page }) => {
-    // Assert initial state: table might be empty
-    const initialRows = await page.getByTestId('ledger-table').locator('tbody tr').count();
-    console.log(`Initial rows: ${initialRows}`);
+  test('Page Title and Header Verification', async ({ page }) => {
+    await expect(page).toHaveTitle(/Crypto Tax/);
+    await expect(page.getByText('Crypto Tax Dashboard')).toBeVisible();
+  });
 
-    // Click sync button
+  test('Wallet Wizard Flow', async ({ page }) => {
+    await page.getByRole('button', { name: /Add Wallet/i }).click();
+    await expect(page.getByText('Connect your exchange')).toBeVisible();
+    
+    // Select Kraken
+    await page.getByRole('button', { name: /Kraken/i }).click();
+    await expect(page.getByPlaceholder('API Key')).toBeVisible();
+    
+    // Fill mock data
+    await page.getByPlaceholder('API Key').fill('test_key');
+    await page.getByPlaceholder('API Secret').fill('test_secret');
+    
+    await page.getByRole('button', { name: /Connect Kraken/i }).click();
+    
+    // Verify it appeared in settings
+    await page.goto('/settings');
+    await expect(page.getByText('kraken')).toBeVisible();
+  });
+
+  test('Transaction Table Data and Sync', async ({ page }) => {
     const syncBtn = page.getByTestId('sync-button');
     await expect(syncBtn).toBeVisible();
+    
+    // Click sync and wait for it to finish (mocked or real)
     await syncBtn.click();
-
-    // Check if it shows "Syncing..."
-    await expect(syncBtn).toHaveText(/Syncing.../);
-
-    // Wait for the button to change back (max timeout 30s as sync can be slow)
+    await expect(syncBtn).toHaveText(/Syncing/);
+    
+    // Wait for "Sync History" to return (sync finished)
     await expect(syncBtn).toHaveText('Sync History', { timeout: 30000 });
-
-    // Assert that TanStack Query cache invalidation triggers UI update
+    
     // The table should now have rows
     const updatedRows = await page.getByTestId('ledger-table').locator('tbody tr').count();
     console.log(`Updated rows: ${updatedRows}`);
@@ -73,7 +90,7 @@ test.describe('Crypto Tax Dashboard E2E', () => {
     const download = await downloadPromise;
 
     // Assert filename
-    expect(download.suggestedFilename()).toBe('form_1399.csv');
+    expect(download.suggestedFilename()).toBe('form_8659.csv');
   });
 
   test('Theme Toggle Verification', async ({ page }) => {
